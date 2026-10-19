@@ -24,6 +24,7 @@
 #include "config.h"
 #include "mcp.h"
 #include "shader_common.h"
+#include "shader_list.h"
 
 /* ==================================================================
  * Utility
@@ -102,9 +103,11 @@ static GLuint create_program(const char *frag_src)
  * Shader list (for no-arg browsing)
  * ================================================================== */
 
-#define MAX_SHADERS 256
-static char *shader_list[MAX_SHADERS];
-static int   shader_count = 0;
+/* Shader paths, grown dynamically. A fixed 256-entry array used to silently
+ * drop the rest; there is no cap now. */
+static shader_list g_shaders;
+#define shader_list  (g_shaders.items)
+#define shader_count (g_shaders.count)
 static int   shader_index = 0;
 
 /* Current shader state (for hot-reload on switch) */
@@ -126,37 +129,8 @@ static const char *g_texture_files[4] = {NULL, NULL, NULL, NULL};
 static int     g_auto_texture[4] = {0, 0, 0, 0};
 static int     g_bindKeyboard = -1;
 
-static int compare_strings(const void *a, const void *b)
-{
-    return strcmp(*(const char **)a, *(const char **)b);
-}
+#define shader_basename shader_list_basename
 
-static void scan_shaders_dir(const char *dir)
-{
-    DIR *d = opendir(dir);
-    if (!d) return;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL && shader_count < MAX_SHADERS) {
-        const char *nm = ent->d_name;
-        size_t nlen = strlen(nm);
-        if (nlen > 5 && strcmp(nm + nlen - 5, ".glsl") == 0) {
-            size_t len = strlen(dir) + 1 + strlen(ent->d_name) + 1;
-            char *path = malloc(len);
-            snprintf(path, len, "%s/%s", dir, ent->d_name);
-            shader_list[shader_count++] = path;
-        }
-    }
-    closedir(d);
-    if (shader_count > 1)
-        qsort(shader_list, shader_count, sizeof(char *), compare_strings);
-}
-
-static const char *shader_basename(const char *path)
-{
-    const char *p = strrchr(path, '/');
-    if (!p) p = strrchr(path, '\\');
-    return p ? p + 1 : path;
-}
 
 static void auto_detect_textures(const char *shader_path)
 {
@@ -574,12 +548,24 @@ int main(int argc, char **argv)
     reset_keystate();
 
     /* Shader list */
+    shader_list_init(&g_shaders);
     if (shader_path) {
-        shader_list[0] = strdup(shader_path);
-        shader_count = 1;
+        if (shader_list_add(&g_shaders, shader_path) != 0) {
+            fprintf(stderr, "Error: out of memory adding shader path.\n");
+            SDL_GL_DeleteContext(g_gl_ctx);
+            SDL_DestroyWindow(g_window);
+            SDL_Quit();
+            return 1;
+        }
         shader_index = 0;
+        /* Be explicit: without the directory scan there is nothing to browse,
+         * so the cycle keys do nothing. Say so rather than failing silently. */
+        fprintf(stderr,
+                "Note: -s loads a single shader, so arrow-key browsing is "
+                "disabled.\n"
+                "      Run without -s to browse everything in shaders/.\n");
     } else {
-        scan_shaders_dir("shaders");
+        shader_list_scan(&g_shaders, "shaders");
         if (shader_count == 0) {
             fprintf(stderr, "Error: no .glsl files found in shaders/ and no -s flag.\n");
             SDL_GL_DeleteContext(g_gl_ctx);
@@ -842,8 +828,7 @@ int main(int argc, char **argv)
         glDeleteTextures(1, &keyStateTexID);
     glDeleteProgram(prog);
 
-    for (int i = 0; i < shader_count; i++)
-        free(shader_list[i]);
+    shader_list_free(&g_shaders);
 
     SDL_GL_DeleteContext(g_gl_ctx);
     SDL_DestroyWindow(g_window);

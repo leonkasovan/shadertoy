@@ -47,6 +47,10 @@ build/shadertoy.exe -s shaders/some_shader.glsl -w 1280 -h 720
 build/shadertoy.exe            # browse everything in shaders/
 ```
 
+Passing `-s` loads exactly that one shader and prints a note that arrow-key
+browsing is disabled (the cycle keys have nothing to cycle through). Omit `-s`
+to browse the whole directory.
+
 ```
 Usage: shadertoy [OPTIONS] [SHADER_PATH]
 
@@ -74,6 +78,10 @@ With no arguments the viewer loads every `.glsl` in `./shaders`, starting on
 the first one that compiles. `←`/`→`, `↑`/`↓`, `PageUp`/`PageDown`, space and
 backspace cycle through shaders; `q` or `Esc` quits. Uncompilable shaders are
 skipped with a message rather than aborting the session.
+
+The shader list is sized dynamically — there is no cap on how many shaders a
+directory may contain. Paths are sorted, so indices in the viewer and in
+`list_shaders` agree with each other and with `ls`.
 
 Channel textures are auto-detected next to the shader: `foo.glsl` picks up
 `foo.0.png`, `foo.1.jpg`, etc. for `iChannel0..3`.
@@ -146,6 +154,8 @@ src/
   mcp.h           — MCP entry point + framing selection
   shader_common.c — shared GLSL header/footer, program build, uniforms
   shader_common.h — shader_common API
+  shader_list.c   — shared dynamic shader-directory scanner
+  shader_list.h   — shader_list API
   config.h        — CLI options table
 glad/       — GLAD OpenGL loader (desktop GL)
 glad_es/    — GLAD OpenGL ES loader (ARM / aarch64)
@@ -197,23 +207,6 @@ is always zero in headless renders.
 ## Known limitations
 
 These are real, currently unfixed issues — not rough edges in the docs.
-
-### Only the first 256 shaders are loaded
-
-`main.c` (`MAX_SHADERS`) and `mcp.c` (`MAX_MCP_SHADERS`) both cap the shader
-list at **256 entries**. Directories with more `.glsl` files are truncated
-without any warning, error, or log line: the extra shaders are simply absent
-from the viewer's cycling order and from `list_shaders`, and their indices
-differ from what you'd get from a plain `ls`. If you hit this, run from a
-directory with fewer shaders — there is no setting to raise the limit.
-
-### `-s` silently disables shader cycling
-
-Passing `-s <file>` loads exactly that one shader. Arrow keys, space and
-PageUp/PageDown become no-ops, because the browser list is only populated when
-no source path is given. Nothing tells you this; the window just stops
-responding to those keys. Use the no-argument form (`shadertoy` with no `-s`)
-if you want to browse.
 
 ### `make SAN=1` does not work on w64devkit
 

@@ -33,6 +33,7 @@
 
 #include "mcp.h"
 #include "shader_common.h"
+#include "shader_list.h"
 
 /* Texture loading for iChannel0..3. main.c owns the STB_IMAGE_IMPLEMENTATION
  * translation unit, so only the declarations are needed here. */
@@ -43,15 +44,12 @@
 #define MCP_SERVER_VERSION   "1.0.0"
 #define MCP_SERVER_TITLE     "Shadertoy SDL2 Renderer"
 
-#define MAX_MCP_SHADERS 256
-
-/* ------------------------------------------------------------------ */
-/* Shader list                                                        */
-/* ------------------------------------------------------------------ */
-
-static char *mcp_shader_list[MAX_MCP_SHADERS];
-static int   mcp_shader_count = 0;
-static int   mcp_shaders_scanned = 0;
+/* Shader paths, grown dynamically via the shared scanner. There is no cap;
+ * the previous fixed 256-entry array silently dropped the rest. */
+static shader_list mcp_shaders;
+#define mcp_shader_list  (mcp_shaders.items)
+#define mcp_shader_count (mcp_shaders.count)
+static int mcp_shaders_scanned = 0;
 
 static char *mcp_read_file(const char *path)
 {
@@ -69,48 +67,12 @@ static char *mcp_read_file(const char *path)
     return buf;
 }
 
-static int mcp_compare_strings(const void *a, const void *b)
-{
-    return strcmp(*(const char **)a, *(const char **)b);
-}
-
-static const char *mcp_shader_basename(const char *path)
-{
-    const char *p = strrchr(path, '/');
-    if (!p) p = strrchr(path, '\\');
-    return p ? p + 1 : path;
-}
-
-static void mcp_scan_shaders_dir(const char *dir)
-{
-    for (int i = 0; i < mcp_shader_count; i++)
-        free(mcp_shader_list[i]);
-    mcp_shader_count = 0;
-
-    DIR *d = opendir(dir);
-    if (!d) return;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL && mcp_shader_count < MAX_MCP_SHADERS) {
-        const char *nm = ent->d_name;
-        size_t nlen = strlen(nm);
-        if (nlen > 5 && strcmp(nm + nlen - 5, ".glsl") == 0) {
-            size_t pl = strlen(dir) + 1 + nlen + 1;
-            char *path = malloc(pl);
-            snprintf(path, pl, "%s/%s", dir, nm);
-            mcp_shader_list[mcp_shader_count++] = path;
-        }
-    }
-    closedir(d);
-    if (mcp_shader_count > 1)
-        qsort(mcp_shader_list, mcp_shader_count, sizeof(char *),
-              mcp_compare_strings);
-    mcp_shaders_scanned = 1;
-}
+#define mcp_shader_basename shader_list_basename
 
 static void mcp_ensure_scanned(void)
 {
     if (!mcp_shaders_scanned)
-        mcp_scan_shaders_dir("shaders");
+        shader_list_scan(&mcp_shaders, "shaders");
 }
 
 /* ------------------------------------------------------------------ */
@@ -871,7 +833,7 @@ static jv tool_compile_shader(jv params)
 static jv tool_reload_shaders(jv params)
 {
     (void)params;
-    mcp_scan_shaders_dir("shaders");
+    shader_list_scan(&mcp_shaders, "shaders");
     char buf[256];
     snprintf(buf, sizeof buf,
              "Rescanned shaders/ directory. Found %d shader(s).",
@@ -942,7 +904,7 @@ static jv tool_write_shader(jv params)
     jv_free(content_jv);
 
     /* Reload shader list */
-    mcp_scan_shaders_dir("shaders");
+    shader_list_scan(&mcp_shaders, "shaders");
 
     /* Find the new shader's index */
     int new_idx = -1;
@@ -1654,6 +1616,8 @@ int mcp_run(void)
     if (mcp_gl_ready)
         mcp_gl_cleanup();
 #endif
+
+    shader_list_free(&mcp_shaders);
 
     return 0;
 }

@@ -122,7 +122,7 @@ TARGET     := $(OUTDIR)/shadertoy$(BINEXT)
 CONSOLE    := $(OUTDIR)/shadertoy-console$(BINEXT)
 endif
 
-SRCS       := src/main.c src/shader_common.c $(GLAD_SRC)
+SRCS       := src/main.c src/shader_common.c src/shader_list.c $(GLAD_SRC)
 
 # MCP (Model Context Protocol) support via libjq
 JQ_CFLAGS  := $(shell pkg-config --cflags libjq 2>/dev/null)
