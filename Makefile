@@ -14,11 +14,18 @@
 
 CC        ?= gcc
 ifeq ($(DEBUG),1)
-CFLAGS    ?= -O0 -g -Wall -Wextra -std=c99 -fsanitize=address -fno-omit-frame-pointer -DDEBUG
-LDFLAGS   ?= -fsanitize=address
+CFLAGS    ?= -O0 -g -Wall -Wextra -std=c99 -DDEBUG
+LDFLAGS   ?=
 else
 CFLAGS    ?= -O2 -DNDEBUG -Wall -Wextra -std=c99
 LDFLAGS   ?=
+endif
+
+# AddressSanitizer is opt-in (SAN=1) because some toolchains (notably
+# w64devkit on Windows) ship no libasan and would fail at link time.
+ifeq ($(SAN),1)
+CFLAGS  += -fsanitize=address -fno-omit-frame-pointer
+LDFLAGS += -fsanitize=address
 endif
 
 # ------------------------------------------------------------------
@@ -109,32 +116,67 @@ endif
 OUTDIR     := build
 ifeq ($(DEBUG),1)
 TARGET     := $(OUTDIR)/shadertoy-debug$(BINEXT)
+CONSOLE    := $(OUTDIR)/shadertoy-debug-console$(BINEXT)
 else
 TARGET     := $(OUTDIR)/shadertoy$(BINEXT)
+CONSOLE    := $(OUTDIR)/shadertoy-console$(BINEXT)
 endif
 
-SRCS       := src/main.c $(GLAD_SRC)
+SRCS       := src/main.c src/shader_common.c $(GLAD_SRC)
+
+# MCP (Model Context Protocol) support via libjq
+JQ_CFLAGS  := $(shell pkg-config --cflags libjq 2>/dev/null)
+JQ_LIBS    := $(shell pkg-config --libs libjq 2>/dev/null)
+ifeq ($(JQ_LIBS),)
+  JQ_ENABLED := 0
+  $(warning libjq not found via pkg-config: building WITHOUT MCP support.)
+  $(warning Install it, e.g. MSYS2: pacman -S mingw-w64-x86_64-jq)
+else
+  JQ_ENABLED := 1
+  SRCS += src/mcp.c
+endif
 OBJS       := $(patsubst %.c,%.o,$(SRCS))
 
+# Console builds must not link the Windows GUI subsystem, otherwise stdout
+# is detached and MCP's stdio transport cannot work through a pipe.
+ifeq ($(IS_WINDOWS),1)
+CONSOLE_SDL_LIBS := $(filter-out -mwindows,$(SDL_LIBS))
+else
+CONSOLE_SDL_LIBS := $(SDL_LIBS)
+endif
+
 all: $(TARGET)
+
+# Console build: same sources, Windows console subsystem. Use this for --mcp.
+console: $(CONSOLE)
+
+mcp: console
 
 $(OUTDIR):
 	mkdir -p $@
 
 src/%.o: src/%.c
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(GL_CFLAGS) $(GLAD_INC) -I. -c -o $@ $<
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(GL_CFLAGS) $(GLAD_INC) $(JQ_CFLAGS) -I. -c -o $@ $<
 
 glad/%.o: glad/%.c
 	$(CC) $(CFLAGS) -Iglad -c -o $@ $<
 
-glad_es/%.o: glad_es/%.c
+glad_es/%.o: glad/%.c
 	$(CC) $(CFLAGS) -Iglad_es -c -o $@ $<
 
 $(TARGET): $(OBJS) | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(SDL_LIBS) $(PLAT_LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(SDL_LIBS) $(PLAT_LIBS) $(JQ_LIBS) $(LDFLAGS)
+ifndef DEBUG
+	strip -s $@
+endif
+
+$(CONSOLE): $(OBJS) | $(OUTDIR)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(CONSOLE_SDL_LIBS) $(PLAT_LIBS) $(JQ_LIBS) $(LDFLAGS)
 ifndef DEBUG
 	strip -s $@
 endif
 
 clean:
 	-rm -rf build src/*.o glad/*.o glad_es/*.o
+
+.PHONY: all clean console mcp

@@ -1,9 +1,13 @@
 /* See LICENSE file for copyright and license details. */
 /*
-* Configuration attributes for EGL context. See eglChooseConfig.
+* Command-line options. Parsed with getopt_long in main.c.
+*
+* Note: -h is --height, not help. Help is -? / --help only, so that the
+* conventional "-h" shorthand for height used by this viewer keeps working.
+* "--mcp-lsp" is long-only (no short form) to avoid burning a letter.
 */
 #include <getopt.h>
-static const char options_string[] = "?fw:h:s:l0:1:2:3:x:y:k:";
+static const char options_string[] = "?fw:h:s:l0:1:2:3:x:y:k:m";
 static struct option long_options[] = {
 {"width", required_argument, 0, 'w'},
 {"height", required_argument, 0, 'h'},
@@ -17,6 +21,8 @@ static struct option long_options[] = {
 {"texture2", required_argument, 0, '2'},
 {"texture3", required_argument, 0, '3'},
 {"keyboard", required_argument, 0, 'k'},
+{"mcp", no_argument, 0, 'm'},
+{"mcp-lsp", no_argument, 0, 'M'},
 {"help", no_argument, 0, '?'},
 {0, 0, 0, 0}
 };

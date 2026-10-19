@@ -1,0 +1,30 @@
+# Build output
+build/
+*.o
+*.obj
+*.exe
+*.dll
+*.a
+*.so
+*.dylib
+
+# Debugging / instrumentation
+*.pdb
+*.ilk
+*.dSYM/
+core
+vgcore.*
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.cache/
+compile_commands.json
+
+# Local agent scratch state (keep machine-specific notes out of the repo)
+.commandcode/
+
+# Accidental output from a malformed `mkdir -p` invocation
+-p/

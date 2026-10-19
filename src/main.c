@@ -22,6 +22,8 @@
 #include <dirent.h>
 #include <time.h>
 #include "config.h"
+#include "mcp.h"
+#include "shader_common.h"
 
 /* ==================================================================
  * Utility
@@ -80,108 +82,19 @@ static GLuint load_texture(const char *path)
 
 /* ==================================================================
  * Shader compilation and program linking
- * ================================================================== */
-
-static GLuint compile_shader(GLenum type, const char *src)
-{
-    GLuint s = glCreateShader(type);
-    GLint ok = 0;
-    glShaderSource(s, 1, &src, NULL);
-    glCompileShader(s);
-    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[4096];
-        GLsizei len = 0;
-        glGetShaderInfoLog(s, sizeof log, &len, log);
-        fprintf(stderr, "shader compile error:\n%s\n", log);
-        exit(1);
-    }
-    return s;
-}
-
-/* ------------------------------------------------------------------
- * GLSL version: 330 core on desktop, 300 es on GLES
- * ------------------------------------------------------------------ */
-#ifdef USE_GLES
-#define GLSL_VERSION "#version 300 es"
-#else
-#define GLSL_VERSION "#version 330 core"
-#endif
-
-/* Fullscreen quad vertex shader */
-static const char *vs_src =
-    GLSL_VERSION "\n"
-    "layout(location = 0) in vec2 aPos;\n"
-    "out vec2 vFragCoord;\n"
-    "uniform vec2 uResolution;\n"
-    "void main() {\n"
-    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
-    "    vFragCoord = (aPos * 0.5 + 0.5) * uResolution;\n"
-    "}\n";
-
-/* Shadertoy-style fragment shader header + footer */
-static const char *frag_header =
-    GLSL_VERSION "\n"
-    "precision highp float;\n"
-    "in vec2 vFragCoord;\n"
-    "uniform vec3  iResolution;\n"
-    "uniform float iTime;\n"
-    "uniform float iTimeDelta;\n"
-    "uniform int   iFrame;\n"
-    "uniform float iFrameRate;\n"
-    "uniform vec4  iMouse;\n"
-    "uniform vec4  iDate;\n"
-    "uniform sampler2D iChannel0;\n"
-    "uniform sampler2D iChannel1;\n"
-    "uniform sampler2D iChannel2;\n"
-    "uniform sampler2D iChannel3;\n"
-    "uniform vec3  iChannelResolution[4];\n"
-    "uniform float iChannelTime[4];\n"
-    "uniform float iSampleRate;\n"
-    "out vec4 fragColor;\n";
-
-static const char *frag_footer =
-    "\nvoid main() { mainImage(fragColor, vFragCoord); }\n";
+ *
+ * The GLSL version, vertex shader, fragment header/footer and uniform
+ * handling all live in shader_common.c so the viewer and the MCP server
+ * cannot drift apart. This file only adds viewer-specific behaviour:
+ * writing diagnostics to stderr.\n * ================================================================== */
 
 static GLuint create_program(const char *frag_src)
 {
-    GLuint p = glCreateProgram();
-    GLuint v = compile_shader(GL_VERTEX_SHADER, vs_src);
-
-    const char *sources[3] = { frag_header, frag_src, frag_footer };
-    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
-    GLint ok = 0;
-    glShaderSource(f, 3, sources, NULL);
-    glCompileShader(f);
-    glGetShaderiv(f, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[4096];
-        GLsizei len = 0;
-        glGetShaderInfoLog(f, sizeof log, &len, log);
-        fprintf(stderr, "fragment shader compile error:\n%s\n", log);
-        glDeleteShader(f);
-        glDeleteShader(v);
-        glDeleteProgram(p);
-        return 0;
-    }
-
-    ok = 0;
-    glAttachShader(p, v);
-    glAttachShader(p, f);
-    glLinkProgram(p);
-    glGetProgramiv(p, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[4096];
-        GLsizei len = 0;
-        glGetProgramInfoLog(p, sizeof log, &len, log);
-        fprintf(stderr, "program link error:\n%s\n", log);
-        glDeleteShader(v);
-        glDeleteShader(f);
-        glDeleteProgram(p);
-        return 0;
-    }
-    glDeleteShader(v);
-    glDeleteShader(f);
+    char log[4096] = {0};
+    GLuint p = shader_build_program(frag_src, log, sizeof log);
+    if (!p)
+        fprintf(stderr, "fragment shader compile error:\n%s\n",
+                log[0] ? log : "(no log available)");
     return p;
 }
 
@@ -196,18 +109,11 @@ static int   shader_index = 0;
 
 /* Current shader state (for hot-reload on switch) */
 static GLuint  current_prog = 0;
-static GLint   current_uRes = -1;
-static GLint   current_uTime = -1;
-static GLint   current_uTimeDelta = -1;
-static GLint   current_uDate = -1;
-static GLint   current_uMouse = -1;
-static GLint   current_uResVert = -1;
-static GLint   current_uCRes = -1;
-static GLint   current_uCTime = -1;
-static GLint   current_uChannel[4] = {-1,-1,-1,-1};
-static GLint   current_uFrame = -1;
-static GLint   current_uFrameRate = -1;
-static GLint   current_uSampleRate = -1;
+static shader_uniforms current_u;
+
+/* Uniform locations for the program currently being drawn. A shader switch
+ * copies current_u into g_u, so the draw loop always reads one struct. */
+static shader_uniforms g_u;
 
 static SDL_Window   *g_window = NULL;
 static SDL_GLContext  g_gl_ctx = NULL;
@@ -216,7 +122,6 @@ static char  g_title_buf[512];
 /* Global texture state */
 static GLuint  g_textures[4] = {0, 0, 0, 0};
 static float   g_chanRes[4][3] = {{0}};
-static GLint   g_uChannel[4] = {-1, -1, -1, -1};
 static const char *g_texture_files[4] = {NULL, NULL, NULL, NULL};
 static int     g_auto_texture[4] = {0, 0, 0, 0};
 static int     g_bindKeyboard = -1;
@@ -299,9 +204,15 @@ static void load_channel_textures(void)
         if (g_texture_files[ch]) {
             g_textures[ch] = load_texture(g_texture_files[ch]);
             if (g_textures[ch]) {
+                /* Query into GLint locals: glGetTexLevelParameteriv writes
+                 * integers, so passing a float* via a cast would alias and
+                 * (worse) store bit patterns, not values. Widen afterwards. */
+                GLint tex_w = 0, tex_h = 0;
                 glBindTexture(GL_TEXTURE_2D, g_textures[ch]);
-                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,  (GLint *)&g_chanRes[ch][0]);
-                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, (GLint *)&g_chanRes[ch][1]);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,  &tex_w);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &tex_h);
+                g_chanRes[ch][0] = (float)tex_w;
+                g_chanRes[ch][1] = (float)tex_h;
                 g_chanRes[ch][2] = 1.0f;
             }
         }
@@ -326,13 +237,7 @@ static void update_window_title(float fps)
     SDL_SetWindowTitle(g_window, g_title_buf);
 }
 
-static GLuint load_shader_index(int idx, GLint *out_uRes, GLint *out_uTime,
-                                GLint *out_uTimeDelta, GLint *out_uDate,
-                                GLint *out_uMouse, GLint *out_uResVert,
-                                GLint *out_uCRes, GLint *out_uCTime,
-                                GLint out_uChannel[4],
-                                GLint *out_uFrame, GLint *out_uFrameRate,
-                                GLint *out_uSampleRate)
+static GLuint load_shader_index(int idx, shader_uniforms *out_u)
 {
     char *src = read_file(shader_list[idx]);
     if (!src) {
@@ -343,22 +248,7 @@ static GLuint load_shader_index(int idx, GLint *out_uRes, GLint *out_uTime,
     GLuint p = create_program(src);
     free(src);
     if (!p) return 0;
-    *out_uRes        = glGetUniformLocation(p, "iResolution");
-    *out_uTime       = glGetUniformLocation(p, "iTime");
-    *out_uTimeDelta  = glGetUniformLocation(p, "iTimeDelta");
-    *out_uDate       = glGetUniformLocation(p, "iDate");
-    *out_uMouse      = glGetUniformLocation(p, "iMouse");
-    *out_uResVert    = glGetUniformLocation(p, "uResolution");
-    *out_uCRes       = glGetUniformLocation(p, "iChannelResolution");
-    *out_uCTime      = glGetUniformLocation(p, "iChannelTime");
-    *out_uFrame      = glGetUniformLocation(p, "iFrame");
-    *out_uFrameRate  = glGetUniformLocation(p, "iFrameRate");
-    *out_uSampleRate = glGetUniformLocation(p, "iSampleRate");
-    for (int ch = 0; ch < 4; ch++) {
-        char name[16];
-        snprintf(name, sizeof name, "iChannel%d", ch);
-        out_uChannel[ch] = glGetUniformLocation(p, name);
-    }
+    shader_uniforms_lookup(p, out_u);
     return p;
 }
 
@@ -372,12 +262,7 @@ static void switch_shader(int delta)
     for (int attempt = 0; attempt < shader_count; attempt++) {
         int new_idx = (shader_index + delta + shader_count) % shader_count;
         if (new_idx == shader_index) return;
-        GLuint new_prog = load_shader_index(new_idx,
-            &current_uRes, &current_uTime, &current_uTimeDelta, &current_uDate,
-            &current_uMouse,
-            &current_uResVert, &current_uCRes, &current_uCTime,
-            current_uChannel, &current_uFrame, &current_uFrameRate,
-            &current_uSampleRate);
+        GLuint new_prog = load_shader_index(new_idx, &current_u);
         if (!new_prog) {
             fprintf(stderr, "Skipping '%s' (compilation failed).\n", shader_list[new_idx]);
             shader_index = new_idx;
@@ -502,10 +387,15 @@ int main(int argc, char **argv)
     int window_y = SDL_WINDOWPOS_UNDEFINED;
     int fullscreen = 0;
     int bindKeyboard = -1;
+    int mcp_mode = 0;
+    int mcp_lsp  = 0;
 
     /* parse command line options via getopt_long (from config.h) */
     int opt;
     int opt_idx = 0;
+    /* Leading ':' makes getopt return ':' (not '?') for a missing argument,
+     * so we can tell "-w with no value" apart from "-h = tall". */
+    opterr = 0;
     while ((opt = getopt_long(argc, argv, options_string, long_options, &opt_idx)) != -1) {
         switch (opt) {
         case 's': shader_path = optarg; break;
@@ -517,24 +407,49 @@ int main(int argc, char **argv)
         case 'x': { int v = atoi(optarg); if (v >= 0) window_x = v; break; }
         case 'y': { int v = atoi(optarg); if (v >= 0) window_y = v; break; }
         case 'k': { int v = atoi(optarg); if (v >= 0 && v < 4) bindKeyboard = v; break; }
+        case 'm': mcp_mode = 1; break;
+        case 'M': mcp_mode = 1; mcp_lsp = 1; break;
         case '?':
+        case ':':
+            if (opt == ':' && optopt == 'h') {
+                /* Bare "-h" has always meant help for users, even though
+                 * --height also needs an argument. Keep -h meaning height
+                 * only when a numeric value follows it. */
+                fprintf(stderr, "Error: -h/--height requires a numeric value "
+                                "(did you mean --help?)\n");
+                return 1;
+            }
             fprintf(stderr,
-                "Usage: %s [OPTIONS]\n\n"
+                "Usage: %s [OPTIONS] [SHADER_PATH]\n\n"
+                "Runs the interactive viewer with no options, loading every\n"
+                ".glsl file in ./shaders (arrow keys / space to cycle).\n\n"
                 "Options:\n"
-                "  -f, --fullscreen        fullscreen mode\n"
+                "  -s, --source <path>     fragment shader source file\n"
                 "  -w, --width <value>     window width (default: 640)\n"
                 "  -h, --height <value>    window height (default: 480)\n"
                 "  -x, --window_x <value>  window X position\n"
                 "  -y, --window_y <value>  window Y position\n"
-                "  -s, --source <path>     fragment shader source file\n"
+                "  -f, --fullscreen        fullscreen mode\n"
                 "  -0, --texture0 <path>   texture for iChannel0\n"
                 "  -1, --texture1 <path>   texture for iChannel1\n"
                 "  -2, --texture2 <path>   texture for iChannel2\n"
                 "  -3, --texture3 <path>   texture for iChannel3\n"
-                "  -k, --keyboard <ch>     bind keyboard to iChannel<ch>\n"
-                "  -?, --help              show this help\n", argv[0]);
-            return 0;
+                "  -k, --keyboard <ch>     bind keyboard state texture to iChannel<ch>\n"
+                "  -m, --mcp               run as an MCP server on stdio\n"
+                "                            (newline-delimited JSON, accepts\n"
+                "                             Content-Length input too)\n"
+                "      --mcp-lsp           run as MCP server, reply with\n"
+                "                             Content-Length framing\n"
+                "  -?, --help              show this help\n\n"
+                "Note: -h is height, not help. Use -? or --help for this text.\n",
+                argv[0]);
+            return (opt == '?') ? 0 : 1;
         }
+    }
+
+    if (mcp_mode) {
+        if (mcp_lsp) mcp_set_framing(1);
+        return mcp_run();
     }
 
     if (bindKeyboard >= 0 && texture_files[bindKeyboard]) {
@@ -703,12 +618,7 @@ int main(int argc, char **argv)
     }
 
     /* Load initial shader */
-    GLuint prog = load_shader_index(shader_index,
-        &current_uRes, &current_uTime, &current_uTimeDelta, &current_uDate,
-        &current_uMouse,
-        &current_uResVert, &current_uCRes, &current_uCTime,
-        current_uChannel, &current_uFrame, &current_uFrameRate,
-        &current_uSampleRate);
+    GLuint prog = load_shader_index(shader_index, &current_u);
     current_prog = prog;
     if (!prog) {
         fprintf(stderr, "Error: shader compilation failed.\n");
@@ -718,17 +628,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    GLint uRes     = current_uRes;
-    GLint uTime    = current_uTime;
-    GLint uMouse   = current_uMouse;
-    GLint uResVert = current_uResVert;
-    GLint uCRes    = current_uCRes;
-    GLint uCTime   = current_uCTime;
-    GLint uFrame      = current_uFrame;
-    GLint uFrameRate  = current_uFrameRate;
-    GLint uSampleRate = current_uSampleRate;
-    GLint uTimeDelta  = current_uTimeDelta;
-    GLint uDate       = current_uDate;
+    g_u = current_u;
 
     /* Copy explicit texture paths and keyboard binding to globals */
     for (int ch = 0; ch < 4; ch++)
@@ -736,11 +636,6 @@ int main(int argc, char **argv)
     g_bindKeyboard = bindKeyboard;
 
     load_channel_textures();
-    for (int ch = 0; ch < 4; ch++) {
-        char name[16];
-        snprintf(name, sizeof name, "iChannel%d", ch);
-        g_uChannel[ch] = glGetUniformLocation(prog, name);
-    }
 
     /* Fullscreen quad */
     static const float quad[] = {
@@ -868,72 +763,68 @@ int main(int argc, char **argv)
         /* Hot-reload uniforms after shader switch */
         if (current_prog != prog) {
             prog = current_prog;
-            uRes     = current_uRes;
-            uTime    = current_uTime;
-            uTimeDelta = current_uTimeDelta;
-            uDate      = current_uDate;
-            uMouse   = current_uMouse;
-            uResVert = current_uResVert;
-            uCRes    = current_uCRes;
-            uCTime   = current_uCTime;
-            uFrame      = current_uFrame;
-            uFrameRate  = current_uFrameRate;
-            uSampleRate = current_uSampleRate;
-            for (int ch = 0; ch < 4; ch++)
-                g_uChannel[ch] = current_uChannel[ch];
+            g_u = current_u;
         }
 
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
         glUseProgram(prog);
-        if (uRes >= 0)     glUniform3f(uRes, g_width, g_height, 1.0f);
-        if (uTime >= 0)    glUniform1f(uTime, t);
-        if (uTimeDelta >= 0) glUniform1f(uTimeDelta, lastFrameTime);
-        if (uDate >= 0 && tm_now) glUniform4f(uDate, (float)(tm_now->tm_year + 1900),
-                                      (float)tm_now->tm_mon,       /* Shadertoy: 0-based */
-                                      (float)tm_now->tm_mday,
-                                      (float)tm_now->tm_hour * 3600.0f +
-                                      (float)tm_now->tm_min * 60.0f +
-                                      (float)tm_now->tm_sec +
-                                      (t - floor(t)));
-        if (uMouse >= 0)   glUniform4f(uMouse, g_mouseX, g_mouseY, g_mouseL, g_mouseR);
-        if (uResVert >= 0) glUniform2f(uResVert, g_width, g_height);
-        if (uCRes >= 0)    glUniform3fv(uCRes, 4, (const float *)g_chanRes);
-        if (uCTime >= 0) {
-            float chanTime[4] = { t, t, t, t };
-            glUniform1fv(uCTime, 4, chanTime);
+
+        /* One shared uploader, so viewer and MCP set identical values. */
+        shader_frame f;
+        shader_frame_defaults(&f);
+        f.width       = g_width;
+        f.height      = g_height;
+        f.time        = t;
+        f.time_delta  = lastFrameTime;
+        f.frame       = frame_number;
+        f.frame_rate  = current_fps;
+        f.mouse_x     = g_mouseX;
+        f.mouse_y     = g_mouseY;
+        f.mouse_left  = g_mouseL;
+        f.mouse_right = g_mouseR;
+        memcpy(f.channel_resolution, g_chanRes, sizeof f.channel_resolution);
+        for (int ch = 0; ch < 4; ch++)
+            f.channel_time[ch] = t;
+        if (tm_now) {
+            f.date_valid   = 1;
+            f.date_year    = (float)(tm_now->tm_year + 1900);
+            f.date_month   = (float)tm_now->tm_mon;   /* Shadertoy: 0-based */
+            f.date_day     = (float)tm_now->tm_mday;
+            f.date_seconds = (float)tm_now->tm_hour * 3600.0f +
+                             (float)tm_now->tm_min * 60.0f +
+                             (float)tm_now->tm_sec +
+                             (t - floor(t));
         }
-        if (uFrame >= 0)      glUniform1i(uFrame, frame_number);
-        if (uFrameRate >= 0)  glUniform1f(uFrameRate, current_fps);
-        if (uSampleRate >= 0) glUniform1f(uSampleRate, 44100.0f);
+        shader_upload_uniforms(&g_u, &f);
 
         /* Bind textures to iChannel0..3 */
         for (int ch = 0; ch < 4; ch++) {
-            if (g_uChannel[ch] >= 0) {
-                glActiveTexture(GL_TEXTURE0 + ch);
-                if (g_textures[ch]) {
-                    glBindTexture(GL_TEXTURE_2D, g_textures[ch]);
-                } else {
-                    static GLuint empty_tex = 0;
-                    if (!empty_tex) {
-                        unsigned char black[4] = {0, 0, 0, 255};
-                        glGenTextures(1, &empty_tex);
-                        glBindTexture(GL_TEXTURE_2D, empty_tex);
-                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0,
-                                     GL_RGBA, GL_UNSIGNED_BYTE, black);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                    }
+            glActiveTexture(GL_TEXTURE0 + ch);
+            if (g_textures[ch]) {
+                glBindTexture(GL_TEXTURE_2D, g_textures[ch]);
+            } else {
+                static GLuint empty_tex = 0;
+                if (!empty_tex) {
+                    unsigned char black[4] = {0, 0, 0, 255};
+                    glGenTextures(1, &empty_tex);
                     glBindTexture(GL_TEXTURE_2D, empty_tex);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, black);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                 }
-                glUniform1i(g_uChannel[ch], ch);
+                glBindTexture(GL_TEXTURE_2D, empty_tex);
             }
         }
 
         /* Update keyboard texture if bound */
         update_keystate_texture();
-        if (g_bindKeyboard >= 0 && g_uChannel[g_bindKeyboard] >= 0)
-            glUniform1i(g_uChannel[g_bindKeyboard], g_bindKeyboard);
+        if (g_bindKeyboard >= 0 && g_bindKeyboard < 4) {
+            glActiveTexture(GL_TEXTURE0 + g_bindKeyboard);
+            if (keyStateTexID)
+                glBindTexture(GL_TEXTURE_2D, keyStateTexID);
+        }
 
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
