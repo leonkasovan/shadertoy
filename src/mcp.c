@@ -685,24 +685,32 @@ static void render_ctx_free(struct render_ctx *r)
     memset(r, 0, sizeof *r);
 }
 
-/* Draw one frame; leaves the FBO bound for glReadPixels. */
-static void render_draw_frame(struct render_ctx *r, float time_val, int frame)
+/* Draw one frame; leaves the FBO bound for glReadPixels. Clears first so a
+ * shader that writes only part of the frame matches the viewer, which clears
+ * every frame; otherwise unwritten pixels are undefined. `time_delta` is the
+ * simulated step between frames and drives iTimeDelta/iFrameRate. */
+static void render_draw_frame(struct render_ctx *r, float time_val,
+                              float time_delta, int frame)
 {
     shader_uniforms u;
     shader_uniforms_lookup(r->prog, &u);
 
     shader_frame f;
     shader_frame_defaults(&f);
-    f.width  = (float)r->width;
-    f.height = (float)r->height;
-    f.time   = time_val;
-    f.frame  = frame;
+    f.width       = (float)r->width;
+    f.height      = (float)r->height;
+    f.time        = time_val;
+    f.time_delta  = time_delta;
+    f.frame_rate  = time_delta > 0.0f ? 1.0f / time_delta : 60.0f;
+    f.frame       = frame;
     memcpy(f.channel_resolution, r->chan_res, sizeof f.channel_resolution);
     for (int ch = 0; ch < 4; ch++)
         f.channel_time[ch] = time_val;
 
     glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
     glViewport(0, 0, r->width, r->height);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(r->prog);
     shader_upload_uniforms(&u, &f);
     glBindVertexArray(r->vao);
@@ -897,9 +905,11 @@ static jv tool_get_fps(jv params)
     if (!render_ctx_create(&r, idx, width, height, err, sizeof err))
         return mcp_tool_error(err);
 
+    /* Benchmark with the documented fixed 16 ms step; iTimeDelta follows it. */
+    const float step = 0.016f;
     Uint32 t0 = SDL_GetTicks();
     for (int i = 0; i < frames; i++)
-        render_draw_frame(&r, (float)i * 0.016f, i);
+        render_draw_frame(&r, (float)i * step, step, i);
     Uint32 t1 = SDL_GetTicks();
     double elapsed = (double)(t1 - t0) / 1000.0;
     double fps = elapsed > 0.0 ? (double)frames / elapsed : 0.0;
@@ -990,7 +1000,7 @@ static jv tool_screenshot(jv params)
     if (!render_ctx_create(&r, idx, width, height, err, sizeof err))
         return mcp_tool_error(err);
 
-    render_draw_frame(&r, time_val, 0);
+    render_draw_frame(&r, time_val, 1.0f / 60.0f, 0);
     char *b64 = render_png_b64(&r);
     render_ctx_free(&r);
     if (!b64)
@@ -1035,7 +1045,7 @@ static jv tool_run_shaders(jv params)
 
     Uint32 t0 = SDL_GetTicks();
     for (int i = 0; i < frames; i++)
-        render_draw_frame(&r, (float)i * dt, i);
+        render_draw_frame(&r, (float)i * dt, dt, i);
     Uint32 t1 = SDL_GetTicks();
     double elapsed = (double)(t1 - t0) / 1000.0;
     double fps = elapsed > 0.0 ? (double)frames / elapsed : 0.0;
@@ -1280,13 +1290,43 @@ static jv tool_load_shader(jv params)
         snprintf(name, sizeof name, "%s", jv_string_value(name_jv));
     jv_free(name_jv);
 
-    int index = arg_int(params, "index", -1, 0, 1000000);
-    if (!name[0] && index < 0)
-        return mcp_tool_error("Provide a shader by 'name' or 'index'");
+    if (!name[0]) {
+        /* Resolve the index against the list list_shaders reports, then hand
+         * the viewer a name. The viewer keeps its own list (a -s start has
+         * just that one entry), so a raw index would select a different
+         * shader there. */
+        mcp_ensure_scanned();
+
+        jv idx_jv = jv_object_get(jv_copy(params), jv_string("index"));
+        if (jv_get_kind(idx_jv) != JV_KIND_NUMBER) {
+            jv_free(idx_jv);
+            return mcp_tool_error("Provide a shader by 'name' or 'index'");
+        }
+        double n = jv_number_value(idx_jv);
+        jv_free(idx_jv);
+
+        if (n < 0.0 || n >= (double)mcp_shaders.count) {
+            /* The directory may have changed since the initial scan. */
+            shader_list_scan(&mcp_shaders, SHADER_DIR);
+            mcp_shaders_scanned = 1;
+        }
+        if (n < 0.0 || n >= (double)mcp_shaders.count) {
+            char msg[160];
+            if (mcp_shaders.count == 0)
+                snprintf(msg, sizeof msg, "No shaders found in %s", SHADER_DIR);
+            else
+                snprintf(msg, sizeof msg,
+                         "Shader index %.0f out of range (0-%d)", n,
+                         mcp_shaders.count - 1);
+            return mcp_tool_error(msg);
+        }
+
+        snprintf(name, sizeof name, "%s",
+                 shader_list_basename(mcp_shader_path((int)n)));
+    }
 
     char err[512] = {0};
-    if (!g_mcp_hooks->load_shader(name[0] ? name : NULL, index,
-                                  err, sizeof err))
+    if (!g_mcp_hooks->load_shader(name, -1, err, sizeof err))
         return mcp_tool_error(err[0] ? err : "Could not load shader");
 
     char status[1024] = {0};
@@ -1521,11 +1561,16 @@ static void mcp_handle_request(jv request)
 
     if (!method) {
         jv_free(method_jv);
-        if (jv_is_valid(id) && jv_get_kind(id) == JV_KIND_NULL)
-            jv_free(id); /* "id": null — not a valid request per JSON-RPC */
-        else if (has_id)
+        /* JSON-RPC still wants an Invalid Request reply when the id is
+         * absent/null; only notifications are allowed to stay silent. */
+        if (!jv_is_valid(id) || jv_get_kind(id) == JV_KIND_NULL) {
+            if (jv_is_valid(id)) jv_free(id);
+            mcp_send_error(jv_null(), -32600, "Invalid Request",
+                           "Request must have a valid method");
+        } else {
             mcp_send_error(id, -32600, "Invalid Request",
                            "Request must have a valid method");
+        }
         jv_free(request);
         return;
     }
@@ -1578,6 +1623,14 @@ static void mcp_process_request(const char *body)
         jv_free(request);
         mcp_send_error(jv_null(), -32700, "Parse error",
                        "Could not parse JSON request");
+        return;
+    }
+    /* mcp_handle_request uses jv_object_get, which asserts on non-objects
+     * (libjq aborts the process). Reject batches and scalar messages here. */
+    if (jv_get_kind(request) != JV_KIND_OBJECT) {
+        jv_free(request);
+        mcp_send_error(jv_null(), -32600, "Invalid Request",
+                       "JSON-RPC message must be an object");
         return;
     }
     mcp_handle_request(request);

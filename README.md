@@ -192,7 +192,9 @@ default sensibly (`frames`, `width`, `height`, `time`, `duration`,
 the `.glsl` suffix appended when missing.
 
 An unknown tool name is reported as a normal tool error (`isError: true`)
-rather than a JSON-RPC protocol error.
+rather than a JSON-RPC protocol error. Non-object messages (including
+JSON-RPC batches) get `-32600` and malformed JSON gets `-32700`; neither
+kills the server.
 
 ## Project structure
 
@@ -246,8 +248,10 @@ If no GPU/display is available the GL tools fail with a clean message;
 read/write/list tools keep working. Channels without a texture get a 1x1
 black texture and are reported as zero in `iChannelResolution`; offscreen
 renders have `iMouse = 0` and no `iDate`, so both stay at their GLSL
-defaults. `screenshot {"window": true}` in viewer mode captures the actual
-frame, including mouse/keyboard/date state.
+defaults. Each offscreen frame is cleared to opaque black first, matching the
+viewer, and `run_shaders` sets `iTimeDelta` to `duration / frames` (so
+`iTime` advances by the same step). `screenshot {"window": true}` in viewer
+mode captures the actual frame, including mouse/keyboard/date state.
 
 ## Known limitations
 
