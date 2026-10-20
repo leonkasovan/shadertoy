@@ -5,9 +5,13 @@
 * Note: -h is --height, not help. Help is -? / --help only, so that the
 * conventional "-h" shorthand for height used by this viewer keeps working.
 * "--mcp-lsp" is long-only (no short form) to avoid burning a letter.
+*
+* The shader header/footer strings used to live here too, but they are
+* shader_common.c's job now — one definition shared by the viewer and the
+* MCP server so they can't drift.
 */
 #include <getopt.h>
-static const char options_string[] = "?fw:h:s:l0:1:2:3:x:y:k:m";
+static const char options_string[] = "?fw:h:s:0:1:2:3:x:y:k:mp:";
 static struct option long_options[] = {
 {"width", required_argument, 0, 'w'},
 {"height", required_argument, 0, 'h'},
@@ -15,7 +19,6 @@ static struct option long_options[] = {
 {"window_y", required_argument, 0, 'y'},
 {"fullscreen", no_argument, 0, 'f'},
 {"source", required_argument, 0, 's'},
-{"legacy", no_argument, 0, 'l'},
 {"texture0", required_argument, 0, '0'},
 {"texture1", required_argument, 0, '1'},
 {"texture2", required_argument, 0, '2'},
@@ -23,54 +26,7 @@ static struct option long_options[] = {
 {"keyboard", required_argument, 0, 'k'},
 {"mcp", no_argument, 0, 'm'},
 {"mcp-lsp", no_argument, 0, 'M'},
+{"mcp-port", required_argument, 0, 'p'},
 {"help", no_argument, 0, '?'},
 {0, 0, 0, 0}
 };
-/*
-* Settings for OpenGL ES 2.0 with GLSL 100 (legacy) and OpenGL ES 3.0 with GLSL 300 ES
-*/
-// OpenGL ES 2.0 / GLSL 100
-static const char common_shader_header_gles2[] =
-"#version 100\n";
-static const char vertex_shader_body_gles2[] =
-"attribute vec4 iPosition;"
-"void main(){gl_Position=iPosition;}";
-static const char fragment_shader_header_gles2[] =
-"uniform vec3 iResolution;"
-"uniform float iGlobalTime;" // legacy
-"uniform float iTime;"
-"uniform float iChannelTime[4];"
-"uniform vec4 iMouse;"
-"uniform vec4 iDate;"
-"uniform float iSampleRate;"
-"uniform vec3 iChannelResolution[4];"
-"uniform sampler2D iChannel0;"
-"uniform sampler2D iChannel1;"
-"uniform sampler2D iChannel2;"
-"uniform sampler2D iChannel3;\n";
-static const char fragment_shader_footer_gles2[] =
-"\nvoid main(){mainImage(gl_FragColor,gl_FragCoord.xy);}";
-// OpenGL ES 3.0 / GLSL 300 es
-static const char common_shader_header_gles3[] =
-"#version 300 es\n";
-static const char vertex_shader_body_gles3[] =
-"layout(location = 0) in vec4 iPosition;"
-"void main() {"
-" gl_Position=iPosition;"
-"}\n";
-static const char fragment_shader_header_gles3[] =
-"uniform vec3 iResolution;"
-"uniform float iGlobalTime;" // legacy
-"uniform float iTime;"
-"uniform float iChannelTime[4];"
-"uniform vec4 iMouse;"
-"uniform vec4 iDate;"
-"uniform float iSampleRate;"
-"uniform vec3 iChannelResolution[4];"
-"uniform sampler2D iChannel0;"
-"uniform sampler2D iChannel1;"
-"uniform sampler2D iChannel2;"
-"uniform sampler2D iChannel3;"
-"out vec4 fragColor;\n";
-static const char fragment_shader_footer_gles3[] =
-"\nvoid main(){mainImage(fragColor, gl_FragCoord.xy);}";

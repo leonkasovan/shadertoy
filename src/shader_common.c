@@ -13,6 +13,10 @@
 
 #include "shader_common.h"
 
+/* stb_image declarations only; the implementation lives in main.c
+ * (STB_IMAGE_IMPLEMENTATION), so there is exactly one copy per binary. */
+#include "../stb_image.h"
+
 /* ------------------------------------------------------------------ */
 /* Source assembly                                                    */
 /* ------------------------------------------------------------------ */
@@ -216,4 +220,110 @@ void shader_upload_uniforms(const shader_uniforms *u, const shader_frame *f)
     for (int ch = 0; ch < 4; ch++)
         if (u->iChannel[ch] >= 0)
             glUniform1i(u->iChannel[ch], ch);
+}
+
+/* ------------------------------------------------------------------ */
+/* File IO                                                            */
+/* ------------------------------------------------------------------ */
+
+char *shader_read_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)len + 1);
+    if (buf) {
+        size_t n = fread(buf, 1, (size_t)len, f);
+        buf[n] = '\0';
+    }
+    fclose(f);
+    return buf;
+}
+
+/* ------------------------------------------------------------------ */
+/* Channel textures                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Single source of truth: both the viewer and the MCP renderer use these
+ * texture settings, so screenshots match what the window shows. */
+static void shader_upload_texture(GLuint tex, int w, int h,
+                                  const unsigned char *rgba)
+{
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, rgba);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+}
+
+void shader_load_channels(const char *shader_path,
+                          const char *explicit_files[4],
+                          GLuint tex[4], float res[4][3])
+{
+    for (int ch = 0; ch < 4; ch++) {
+        tex[ch] = 0;
+        res[ch][0] = res[ch][1] = res[ch][2] = 0.0f;
+    }
+
+    static const char *exts[] = { "png", "jpg", "jpeg", "bmp", "tga" };
+
+    /* Stem = shader path minus ".glsl" (texture siblings share it). */
+    char stem[1024];
+    snprintf(stem, sizeof stem, "%s", shader_path ? shader_path : "");
+    size_t slen = strlen(stem);
+    if (slen > 5 && strcmp(stem + slen - 5, ".glsl") == 0)
+        stem[slen - 5] = '\0';
+
+    for (int ch = 0; ch < 4; ch++) {
+        const char *file = explicit_files ? explicit_files[ch] : NULL;
+        for (size_t e = 0; !file && e < sizeof exts / sizeof exts[0]; e++) {
+            char path[1200];
+            snprintf(path, sizeof path, "%s.%d.%s", stem, ch, exts[e]);
+            FILE *fp = fopen(path, "rb");
+            if (!fp) continue;
+            fclose(fp);
+            file = path;
+            break;
+        }
+        if (!file) continue;
+
+        int w = 0, h = 0, n = 0;
+        stbi_set_flip_vertically_on_load(1);
+        unsigned char *pixels = stbi_load(file, &w, &h, &n, 4);
+        if (!pixels) continue;
+
+        glGenTextures(1, &tex[ch]);
+        shader_upload_texture(tex[ch], w, h, pixels);
+        stbi_image_free(pixels);
+
+        res[ch][0] = (float)w;
+        res[ch][1] = (float)h;
+        res[ch][2] = 1.0f;
+    }
+}
+
+void shader_bind_channels(const GLuint tex[4])
+{
+    static GLuint black_tex = 0;
+    if (!black_tex) {
+        const unsigned char black[4] = { 0, 0, 0, 255 };
+        glGenTextures(1, &black_tex);
+        shader_upload_texture(black_tex, 1, 1, black);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    }
+    for (int ch = 0; ch < 4; ch++) {
+        glActiveTexture(GL_TEXTURE0 + ch);
+        glBindTexture(GL_TEXTURE_2D, tex[ch] ? tex[ch] : black_tex);
+    }
+}
+
+void shader_free_channels(GLuint tex[4])
+{
+    for (int ch = 0; ch < 4; ch++)
+        if (tex[ch]) glDeleteTextures(1, &tex[ch]);
 }

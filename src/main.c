@@ -19,96 +19,40 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <dirent.h>
 #include <time.h>
 #include "config.h"
 #include "mcp.h"
+#ifdef MCP_UNAVAILABLE
+/* Built without libjq (Makefile sets this define): keep the viewer building
+ * and make --mcp fail with a clear message instead of a link error. */
+int mcp_run(void)
+{
+    fprintf(stderr, "Error: this build has no MCP support; install libjq "
+                    "(e.g. MSYS2: pacman -S mingw-w64-x86_64-jq) and rebuild.\n");
+    return 1;
+}
+int mcp_set_framing(int lsp) { (void)lsp; return 0; }
+int mcp_viewer_start(int port, const mcp_viewer_hooks *hooks)
+{ (void)port; (void)hooks; return 1; }
+void mcp_viewer_poll(void) {}
+void mcp_viewer_stop(void) {}
+int mcp_viewer_port(void) { return 0; }
+#endif
 #include "shader_common.h"
 #include "shader_list.h"
-
-/* ==================================================================
- * Utility
- * ================================================================== */
-
-static char *read_file(const char *path)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)len + 1);
-    if (buf) {
-        size_t n = fread(buf, 1, (size_t)len, f);
-        buf[n] = '\0';
-    }
-    fclose(f);
-    return buf;
-}
-
-static int file_exists(const char *path)
-{
-    FILE *f = fopen(path, "rb");
-    if (f) { fclose(f); return 1; }
-    return 0;
-}
-
-/* ==================================================================
- * Texture loading via stb_image
- * ================================================================== */
-
-static GLuint load_texture(const char *path)
-{
-    int w, h, channels;
-    stbi_set_flip_vertically_on_load(1);
-    unsigned char *data = stbi_load(path, &w, &h, &channels, 4);
-    if (!data) {
-        fprintf(stderr, "failed to load texture '%s': %s\n", path, stbi_failure_reason());
-        return 0;
-    }
-    printf("Loaded texture: %s (%dx%d, %d ch)\n", path, w, h, channels);
-
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    glGenerateMipmap(GL_TEXTURE_2D);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    stbi_image_free(data);
-    return tex;
-}
-
-/* ==================================================================
- * Shader compilation and program linking
- *
- * The GLSL version, vertex shader, fragment header/footer and uniform
- * handling all live in shader_common.c so the viewer and the MCP server
- * cannot drift apart. This file only adds viewer-specific behaviour:
- * writing diagnostics to stderr.\n * ================================================================== */
-
-static GLuint create_program(const char *frag_src)
-{
-    char log[4096] = {0};
-    GLuint p = shader_build_program(frag_src, log, sizeof log);
-    if (!p)
-        fprintf(stderr, "fragment shader compile error:\n%s\n",
-                log[0] ? log : "(no log available)");
-    return p;
-}
 
 /* ==================================================================
  * Shader list (for no-arg browsing)
  * ================================================================== */
 
-/* Shader paths, grown dynamically. A fixed 256-entry array used to silently
- * drop the rest; there is no cap now. */
+/* Shader paths, grown dynamically. */
 static shader_list g_shaders;
-#define shader_list  (g_shaders.items)
+#define shader_paths (g_shaders.items)
 #define shader_count (g_shaders.count)
 static int   shader_index = 0;
+static unsigned long long current_source_hash;
+static int    current_source_hash_valid = 0;
+static int    reload_channels_pending = 0;
 
 /* Current shader state (for hot-reload on switch) */
 static GLuint  current_prog = 0;
@@ -121,76 +65,24 @@ static shader_uniforms g_u;
 static SDL_Window   *g_window = NULL;
 static SDL_GLContext  g_gl_ctx = NULL;
 static char  g_title_buf[512];
+static float g_display_fps = 0.0f;
 
-/* Global texture state */
-static GLuint  g_textures[4] = {0, 0, 0, 0};
+/* Explicit CLI channel textures (`--texture0..3`); auto-detected textures
+ * live in shader_common and are never stored here. */
+static const char *g_tex_cli[4] = { NULL, NULL, NULL, NULL };
 static float   g_chanRes[4][3] = {{0}};
-static const char *g_texture_files[4] = {NULL, NULL, NULL, NULL};
-static int     g_auto_texture[4] = {0, 0, 0, 0};
+static GLuint  g_textures[4] = {0, 0, 0, 0};
 static int     g_bindKeyboard = -1;
 
 #define shader_basename shader_list_basename
 
-
-static void auto_detect_textures(const char *shader_path)
-{
-    size_t len = strlen(shader_path);
-    if (len < 5) return;
-    const char *ext = shader_path + len - 5;
-    if (strcmp(ext, ".glsl") != 0) return;
-
-    size_t base_len = len - 5;
-    for (int ch = 0; ch < 4; ch++) {
-        if (g_texture_files[ch]) continue;
-        char path[512];
-        snprintf(path, sizeof path, "%.*s.%d.png", (int)base_len, shader_path, ch);
-        if (file_exists(path)) {
-            g_texture_files[ch] = strdup(path);
-            g_auto_texture[ch] = 1;
-        } else {
-            snprintf(path, sizeof path, "%.*s.%d.jpg", (int)base_len, shader_path, ch);
-            if (file_exists(path)) {
-                g_texture_files[ch] = strdup(path);
-                g_auto_texture[ch] = 1;
-            }
-        }
-    }
-}
-
+/* (Re)load the channel textures for the current shader: CLI-explicit files
+ * win, otherwise auto-detect "<shader>.<ch>.<ext>" via shader_common. */
 static void load_channel_textures(void)
 {
-    for (int ch = 0; ch < 4; ch++) {
-        if (g_textures[ch]) {
-            glDeleteTextures(1, &g_textures[ch]);
-            g_textures[ch] = 0;
-            g_chanRes[ch][0] = g_chanRes[ch][1] = g_chanRes[ch][2] = 0;
-        }
-        if (g_auto_texture[ch]) {
-            free((void *)g_texture_files[ch]);
-            g_texture_files[ch] = NULL;
-            g_auto_texture[ch] = 0;
-        }
-    }
-
-    auto_detect_textures(shader_list[shader_index]);
-
-    for (int ch = 0; ch < 4; ch++) {
-        if (g_texture_files[ch]) {
-            g_textures[ch] = load_texture(g_texture_files[ch]);
-            if (g_textures[ch]) {
-                /* Query into GLint locals: glGetTexLevelParameteriv writes
-                 * integers, so passing a float* via a cast would alias and
-                 * (worse) store bit patterns, not values. Widen afterwards. */
-                GLint tex_w = 0, tex_h = 0;
-                glBindTexture(GL_TEXTURE_2D, g_textures[ch]);
-                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,  &tex_w);
-                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &tex_h);
-                g_chanRes[ch][0] = (float)tex_w;
-                g_chanRes[ch][1] = (float)tex_h;
-                g_chanRes[ch][2] = 1.0f;
-            }
-        }
-    }
+    shader_free_channels(g_textures);
+    shader_load_channels(shader_paths[shader_index], g_tex_cli,
+                         g_textures, g_chanRes);
 
     if (g_bindKeyboard >= 0) {
         g_chanRes[g_bindKeyboard][0] = 256.0f;
@@ -201,7 +93,7 @@ static void load_channel_textures(void)
 
 static void update_window_title(float fps)
 {
-    const char *name = shader_basename(shader_list[shader_index]);
+    const char *name = shader_basename(shader_paths[shader_index]);
     if (shader_count > 1)
         snprintf(g_title_buf, sizeof g_title_buf, "[%d/%d] %s  %.1f FPS",
                  shader_index + 1, shader_count, name, fps);
@@ -211,18 +103,46 @@ static void update_window_title(float fps)
     SDL_SetWindowTitle(g_window, g_title_buf);
 }
 
-static GLuint load_shader_index(int idx, shader_uniforms *out_u)
+/* Viewer-side compilation: the shared builder, with diagnostics on stderr. */
+static GLuint create_program(const char *frag_src, shader_uniforms *out_u)
 {
-    char *src = read_file(shader_list[idx]);
-    if (!src) {
-        fprintf(stderr, "Error: could not read %s\n", shader_list[idx]);
+    char log[4096] = {0};
+    GLuint p = shader_build_program(frag_src, log, sizeof log);
+    if (!p) {
+        fprintf(stderr, "fragment shader compile error:\n%s\n",
+                log[0] ? log : "(no log available)");
         return 0;
     }
-    printf("Loading shader [%d/%d]: %s\n", idx + 1, shader_count, shader_list[idx]);
-    GLuint p = create_program(src);
+    if (out_u)
+        shader_uniforms_lookup(p, out_u);
+    return p;
+}
+
+/* FNV-1a over the source bytes. Content beats mtime here: Windows stat has
+ * one-second resolution, so back-to-back agent writes were invisible. */
+static unsigned long long hash_source(const char *src)
+{
+    unsigned long long h = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        h ^= *p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static GLuint load_shader_index(int idx, shader_uniforms *out_u,
+                                unsigned long long *out_hash)
+{
+    char *src = shader_read_file(shader_paths[idx]);
+    if (!src) {
+        fprintf(stderr, "Error: could not read %s\n", shader_paths[idx]);
+        return 0;
+    }
+    fprintf(stderr, "Loading shader [%d/%d]: %s\n", idx + 1, shader_count, shader_paths[idx]);
+    if (out_hash)
+        *out_hash = hash_source(src);
+    GLuint p = create_program(src, out_u);
     free(src);
-    if (!p) return 0;
-    shader_uniforms_lookup(p, out_u);
     return p;
 }
 
@@ -233,12 +153,14 @@ static void switch_shader(int delta)
     /* Advance until a shader actually compiles, trying each entry at most
      * once so a run of broken files can't loop forever. On total failure
      * the previously loaded shader keeps running. */
+    int original_index = shader_index;
     for (int attempt = 0; attempt < shader_count; attempt++) {
         int new_idx = (shader_index + delta + shader_count) % shader_count;
         if (new_idx == shader_index) return;
-        GLuint new_prog = load_shader_index(new_idx, &current_u);
+        unsigned long long new_hash = 0;
+        GLuint new_prog = load_shader_index(new_idx, &current_u, &new_hash);
         if (!new_prog) {
-            fprintf(stderr, "Skipping '%s' (compilation failed).\n", shader_list[new_idx]);
+            fprintf(stderr, "Skipping '%s' (compilation failed).\n", shader_paths[new_idx]);
             shader_index = new_idx;
             continue;
         }
@@ -246,12 +168,133 @@ static void switch_shader(int delta)
             glDeleteProgram(current_prog);
         shader_index = new_idx;
         current_prog = new_prog;
+        current_source_hash = new_hash;
+        current_source_hash_valid = 1;
         /* Auto-detect and reload textures for new shader */
         load_channel_textures();
         return;
     }
+    shader_index = original_index;
     fprintf(stderr, "No other shader compiled; keeping current one.\n");
 }
+
+/* ==================================================================
+ * MCP viewer hooks (architecture B)
+ * ================================================================== */
+
+/* Rescan shaders/ and keep the current shader selected by filename, so
+ * files created by MCP tools appear without restarting the viewer. */
+static void rescan_shaders_preserving_current(void)
+{
+    shader_list fresh;
+    shader_list_init(&fresh);
+    if (shader_list_scan(&fresh, "shaders") <= 0) {
+        shader_list_free(&fresh);
+        return;
+    }
+    char current_name[512];
+    snprintf(current_name, sizeof current_name, "%s",
+             shader_basename(shader_paths[shader_index]));
+    shader_list_free(&g_shaders);
+    g_shaders = fresh;
+    int found = 0;
+    for (int i = 0; i < shader_count; i++) {
+        if (strcmp(shader_basename(shader_paths[i]), current_name) == 0) {
+            shader_index = i;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        shader_index = 0;
+        current_source_hash_valid = 0;
+        reload_channels_pending = 1;
+    }
+}
+
+static int find_shader_by_name(const char *name)
+{
+    for (int i = 0; i < shader_count; i++) {
+        const char *path = shader_paths[i];
+        const char *base = shader_basename(path);
+        if (strcmp(path, name) == 0 || strcmp(base, name) == 0)
+            return i;
+        size_t blen = strlen(base), nlen = strlen(name);
+        if (blen > 5 && strcmp(base + blen - 5, ".glsl") == 0 &&
+            nlen == blen - 5 && strncmp(base, name, nlen) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* Main thread, GL context current: called from mcp_viewer_poll(). */
+static int viewer_hook_load_shader(const char *name, int index,
+                                   char *err, size_t errlen)
+{
+    int idx = index;
+    if (name && *name) {
+        idx = find_shader_by_name(name);
+        if (idx < 0) {
+            /* May have just been written by write_shader. */
+            rescan_shaders_preserving_current();
+            idx = find_shader_by_name(name);
+        }
+        if (idx < 0) {
+            snprintf(err, errlen, "Unknown shader: %s", name);
+            return 0;
+        }
+    }
+    if (idx < 0 || idx >= shader_count) {
+        rescan_shaders_preserving_current();
+        if (idx < 0 || idx >= shader_count) {
+            snprintf(err, errlen, "Shader index out of range (0..%d)",
+                     shader_count - 1);
+            return 0;
+        }
+    }
+    if (idx == shader_index)
+        return 1;
+
+    shader_uniforms u;
+    unsigned long long h = 0;
+    GLuint p = load_shader_index(idx, &u, &h);
+    if (!p) {
+        snprintf(err, errlen, "Shader failed to compile: %s",
+                 shader_basename(shader_paths[idx]));
+        return 0;
+    }
+    if (current_prog)
+        glDeleteProgram(current_prog);
+    shader_index = idx;
+    current_prog = p;
+    current_u = u;
+    g_u = u;
+    current_source_hash = h;
+    current_source_hash_valid = 1;
+    load_channel_textures();
+    update_window_title(g_display_fps);
+    return 1;
+}
+
+static void viewer_hook_status(char *buf, size_t len)
+{
+    int w = 0, h = 0;
+    if (g_window)
+        SDL_GetWindowSize(g_window, &w, &h);
+    snprintf(buf, len,
+             "running: yes\n"
+             "shader: %s\n"
+             "index: %d/%d\n"
+             "window: %dx%d\n"
+             "fps: %.1f",
+             shader_basename(shader_paths[shader_index]),
+             shader_index + 1, shader_count, w, h, g_display_fps);
+}
+
+static const mcp_viewer_hooks g_mcp_viewer_hooks = {
+    viewer_hook_load_shader,
+    viewer_hook_status
+};
 
 /* ==================================================================
  * Keyboard state texture (Shadertoy-compatible)
@@ -354,7 +397,6 @@ int main(int argc, char **argv)
 {
     (void)argc;
     const char *shader_path = NULL;
-    const char *texture_files[4] = { NULL, NULL, NULL, NULL };
     int window_width  = 640;
     int window_height = 480;
     int window_x = SDL_WINDOWPOS_UNDEFINED;
@@ -363,6 +405,7 @@ int main(int argc, char **argv)
     int bindKeyboard = -1;
     int mcp_mode = 0;
     int mcp_lsp  = 0;
+    int mcp_port = 8642;
 
     /* parse command line options via getopt_long (from config.h) */
     int opt;
@@ -374,7 +417,7 @@ int main(int argc, char **argv)
         switch (opt) {
         case 's': shader_path = optarg; break;
         case '0': case '1': case '2': case '3':
-            texture_files[opt - '0'] = optarg; break;
+            g_tex_cli[opt - '0'] = optarg; break;
         case 'f': fullscreen = 1; break;
         case 'w': { int v = atoi(optarg); if (v > 0) window_width = v; break; }
         case 'h': { int v = atoi(optarg); if (v > 0) window_height = v; break; }
@@ -383,6 +426,11 @@ int main(int argc, char **argv)
         case 'k': { int v = atoi(optarg); if (v >= 0 && v < 4) bindKeyboard = v; break; }
         case 'm': mcp_mode = 1; break;
         case 'M': mcp_mode = 1; mcp_lsp = 1; break;
+        case 'p': {
+            int v = atoi(optarg);
+            if (v >= 0 && v <= 65535) mcp_port = v;
+            break;
+        }
         case '?':
         case ':':
             if (opt == ':' && optopt == 'h') {
@@ -409,11 +457,13 @@ int main(int argc, char **argv)
                 "  -2, --texture2 <path>   texture for iChannel2\n"
                 "  -3, --texture3 <path>   texture for iChannel3\n"
                 "  -k, --keyboard <ch>     bind keyboard state texture to iChannel<ch>\n"
-                "  -m, --mcp               run as an MCP server on stdio\n"
-                "                            (newline-delimited JSON, accepts\n"
+                "  -m, --mcp               run as a standalone MCP server on stdio\n"
+                "                            (one JSON message per line; accepts\n"
                 "                             Content-Length input too)\n"
-                "      --mcp-lsp           run as MCP server, reply with\n"
-                "                             Content-Length framing\n"
+                "      --mcp-lsp           MCP server replying with Content-Length\n"
+                "                             framing\n"
+                "  -p, --mcp-port <n>      viewer MCP HTTP port (default: 8642,\n"
+                "                             0 disables the server)\n"
                 "  -?, --help              show this help\n\n"
                 "Note: -h is height, not help. Use -? or --help for this text.\n",
                 argv[0]);
@@ -421,18 +471,23 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Usage documents [SHADER_PATH] as the positional form of --source;
+     * -s <path> wins if both are given. */
+    if (optind < argc)
+        shader_path = argv[optind];
+
     if (mcp_mode) {
-        if (mcp_lsp) mcp_set_framing(1);
+        /* Standalone headless server: never touches the window loop. */
+        mcp_set_framing(mcp_lsp);
         return mcp_run();
     }
 
-    if (bindKeyboard >= 0 && texture_files[bindKeyboard]) {
+    if (bindKeyboard >= 0 && g_tex_cli[bindKeyboard]) {
         fprintf(stderr, "Error: cannot bind texture and keyboard to the same channel.\n");
         return 1;
     }
-    if (bindKeyboard >= 0) {
+    if (bindKeyboard >= 0)
         printf("Dynamic keyboard texture bound to iChannel%d.\n", bindKeyboard);
-    }
 
     /* Init SDL2 */
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -579,12 +634,12 @@ int main(int argc, char **argv)
          * so one broken file doesn't kill the whole browser session. */
         int found = 0;
         for (int i = 0; i < shader_count; i++) {
-            char *src = read_file(shader_list[i]);
+            char *src = shader_read_file(shader_paths[i]);
             if (!src) {
-                fprintf(stderr, "Could not read '%s', skipping.\n", shader_list[i]);
+                fprintf(stderr, "Could not read '%s', skipping.\n", shader_paths[i]);
                 continue;
             }
-            GLuint test_prog = create_program(src);
+            GLuint test_prog = create_program(src, NULL);
             free(src);
             if (test_prog) {
                 glDeleteProgram(test_prog);
@@ -604,8 +659,10 @@ int main(int argc, char **argv)
     }
 
     /* Load initial shader */
-    GLuint prog = load_shader_index(shader_index, &current_u);
+    GLuint prog = load_shader_index(shader_index, &current_u,
+                                    &current_source_hash);
     current_prog = prog;
+    current_source_hash_valid = 1;
     if (!prog) {
         fprintf(stderr, "Error: shader compilation failed.\n");
         SDL_GL_DeleteContext(g_gl_ctx);
@@ -616,12 +673,30 @@ int main(int argc, char **argv)
 
     g_u = current_u;
 
-    /* Copy explicit texture paths and keyboard binding to globals */
-    for (int ch = 0; ch < 4; ch++)
-        g_texture_files[ch] = texture_files[ch];
     g_bindKeyboard = bindKeyboard;
 
     load_channel_textures();
+
+    /* Architecture B: the viewer hosts the MCP server. A port conflict is
+     * fatal so the configured client URL never talks to the wrong instance. */
+    if (!mcp_viewer_start(mcp_port, &g_mcp_viewer_hooks)) {
+        char msg[512];
+        snprintf(msg, sizeof msg,
+                 "Could not start the MCP server on 127.0.0.1:%d.\n"
+                 "Is another viewer already running?\n"
+                 "See build/shadertoy-mcp.log.", mcp_port);
+        fprintf(stderr, "%s\n", msg);
+        /* GUI build has no console; don't disappear silently. */
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                                 "Shadertoy MCP", msg, g_window);
+        shader_free_channels(g_textures);
+        glDeleteProgram(prog);
+        shader_list_free(&g_shaders);
+        SDL_GL_DeleteContext(g_gl_ctx);
+        SDL_DestroyWindow(g_window);
+        SDL_Quit();
+        return 1;
+    }
 
     /* Fullscreen quad */
     static const float quad[] = {
@@ -729,12 +804,55 @@ int main(int argc, char **argv)
         float lastFrameTime = t - prev_t;
         prev_t = t;
 
+        /* Pick up shaders created by the MCP server without restarting. */
+        {
+            static Uint32 last_scan = 0;
+            Uint32 now_ticks = SDL_GetTicks();
+            if (!shader_path && now_ticks - last_scan >= 1000) {
+                last_scan = now_ticks;
+                rescan_shaders_preserving_current();
+            }
+        }
+
+        /* Hot-reload by content, not mtime: Windows stat has one-second
+         * resolution, so same-second rewrites used to be missed. */
+        {
+            static Uint32 last_poll = 0;
+            Uint32 now_ticks = SDL_GetTicks();
+            if (now_ticks - last_poll >= 250) {
+                last_poll = now_ticks;
+                char *src = shader_read_file(shader_paths[shader_index]);
+                if (src) {
+                    unsigned long long h = hash_source(src);
+                    if (!current_source_hash_valid ||
+                        h != current_source_hash) {
+                        current_source_hash = h;
+                        current_source_hash_valid = 1;
+                        GLuint reloaded = create_program(src, &current_u);
+                        if (reloaded) {
+                            if (current_prog && current_prog != reloaded)
+                                glDeleteProgram(current_prog);
+                            current_prog = reloaded;
+                            if (reload_channels_pending) {
+                                load_channel_textures();
+                                reload_channels_pending = 0;
+                            }
+                            fprintf(stderr, "Reloaded shader: %s\n",
+                                    shader_paths[shader_index]);
+                        }
+                    }
+                    free(src);
+                }
+            }
+        }
+
         /* FPS calculation */
         frame_count++;
         frame_number++;
         float dt = t - fps_timer;
         if (dt >= 0.5f) {
             current_fps = (float)frame_count / dt;
+            g_display_fps = current_fps;
             frame_count = 0;
             fps_timer = t;
             update_window_title(current_fps);
@@ -752,6 +870,9 @@ int main(int argc, char **argv)
             g_u = current_u;
         }
 
+        /* Offscreen MCP tools leave their own framebuffer bound. */
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, (int)g_width, (int)g_height);
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
@@ -785,45 +906,31 @@ int main(int argc, char **argv)
         }
         shader_upload_uniforms(&g_u, &f);
 
-        /* Bind textures to iChannel0..3 */
-        for (int ch = 0; ch < 4; ch++) {
-            glActiveTexture(GL_TEXTURE0 + ch);
-            if (g_textures[ch]) {
-                glBindTexture(GL_TEXTURE_2D, g_textures[ch]);
-            } else {
-                static GLuint empty_tex = 0;
-                if (!empty_tex) {
-                    unsigned char black[4] = {0, 0, 0, 255};
-                    glGenTextures(1, &empty_tex);
-                    glBindTexture(GL_TEXTURE_2D, empty_tex);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0,
-                                 GL_RGBA, GL_UNSIGNED_BYTE, black);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                }
-                glBindTexture(GL_TEXTURE_2D, empty_tex);
-            }
-        }
-
-        /* Update keyboard texture if bound */
+        /* Bind textures to iChannel0..3, then override the keyboard channel
+         * if one is bound. Black fallbacks come from shader_common. */
+        shader_bind_channels(g_textures);
         update_keystate_texture();
-        if (g_bindKeyboard >= 0 && g_bindKeyboard < 4) {
+        if (g_bindKeyboard >= 0 && keyStateTexID && g_bindKeyboard < 4) {
             glActiveTexture(GL_TEXTURE0 + g_bindKeyboard);
-            if (keyStateTexID)
-                glBindTexture(GL_TEXTURE_2D, keyStateTexID);
+            glBindTexture(GL_TEXTURE_2D, keyStateTexID);
         }
 
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
+        /* MCP jobs run here so window screenshots see this frame's pixels. */
+        mcp_viewer_poll();
+
         SDL_GL_SwapWindow(g_window);
         partially_reset_keystate();
     }
 
+    mcp_viewer_stop();
+
     /* Cleanup */
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
-    for (int ch = 0; ch < 4; ch++)
-        if (g_textures[ch]) glDeleteTextures(1, &g_textures[ch]);
+    shader_free_channels(g_textures);
     if (keyStateTexID)
         glDeleteTextures(1, &keyStateTexID);
     glDeleteProgram(prog);

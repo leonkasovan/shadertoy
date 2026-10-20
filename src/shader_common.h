@@ -104,4 +104,30 @@ void shader_upload_uniforms(const shader_uniforms *u, const shader_frame *f);
 /* Scale factor for iResolution.z (always 1.0 here; kept for clarity). */
 #define SHADER_PIXEL_ASPECT 1.0f
 
+/* ---------------------------------------------------------------- */
+/* File IO + channel textures (shared by viewer and MCP server)      */
+/* ---------------------------------------------------------------- */
+
+/* Read a whole file into a malloc'd NUL-terminated buffer.
+ * Returns NULL if the file cannot be opened (or on allocation failure). */
+char *shader_read_file(const char *path);
+
+/* Load iChannel0..3 textures for a shader.
+ * For each channel: use `explicit_files[ch]` if non-NULL, else auto-detect
+ * "<shader stem>.<ch>.<ext>" next to the shader for ext in
+ * png,jpg,jpeg,bmp,tga. Channels with no texture are left 0 and reported
+ * as zero resolution.
+ * Requires a current GL context; `tex[]` and `res[][]` are fully reset
+ * (zeroed) before loading. */
+void shader_load_channels(const char *shader_path,
+                          const char *explicit_files[4],
+                          GLuint tex[4], float res[4][3]);
+
+/* Bind tex[ch] to texture unit ch; channels without a texture get a shared
+ * 1x1 black fallback so samplers are always valid. */
+void shader_bind_channels(const GLuint tex[4]);
+
+/* Delete the channel textures (the shared black fallback is kept). */
+void shader_free_channels(GLuint tex[4]);
+
 #endif /* SHADER_COMMON_H */

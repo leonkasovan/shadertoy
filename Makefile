@@ -100,7 +100,7 @@ endif
 
 ifeq ($(IS_WINDOWS),1)
   BINEXT    := .exe
-  PLAT_LIBS := -lopengl32 -lgdi32
+  PLAT_LIBS := -lopengl32 -lgdi32 -lws2_32
 else
   BINEXT    :=
   PLAT_LIBS := -lm -ldl
@@ -129,6 +129,8 @@ JQ_CFLAGS  := $(shell pkg-config --cflags libjq 2>/dev/null)
 JQ_LIBS    := $(shell pkg-config --libs libjq 2>/dev/null)
 ifeq ($(JQ_LIBS),)
   JQ_ENABLED := 0
+  # Compile-time flag so main.c can stub mcp_run() instead of failing at link.
+  JQ_CFLAGS  := -DMCP_UNAVAILABLE
   $(warning libjq not found via pkg-config: building WITHOUT MCP support.)
   $(warning Install it, e.g. MSYS2: pacman -S mingw-w64-x86_64-jq)
 else
@@ -161,11 +163,11 @@ src/%.o: src/%.c
 glad/%.o: glad/%.c
 	$(CC) $(CFLAGS) -Iglad -c -o $@ $<
 
-glad_es/%.o: glad/%.c
+glad_es/%.o: glad_es/%.c
 	$(CC) $(CFLAGS) -Iglad_es -c -o $@ $<
 
 $(TARGET): $(OBJS) | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(SDL_LIBS) $(PLAT_LIBS) $(JQ_LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(CONSOLE_SDL_LIBS) $(PLAT_LIBS) $(JQ_LIBS) $(LDFLAGS)
 ifndef DEBUG
 	strip -s $@
 endif

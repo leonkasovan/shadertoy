@@ -1,30 +1,47 @@
 # shadertoy-sdl2
 
 A Shadertoy-style GLSL fragment shader viewer built with SDL2 + OpenGL 3.3,
-and a companion **MCP server** (`--mcp` / `-m`) that exposes shader tools
-over JSON-RPC 2.0 on stdio.
+with a built-in **MCP server** for editing shaders via AI agents.
+
+```
+shadertoy.exe  (viewer + MCP server)        MCP client
+        |  HTTP 127.0.0.1:8642/mcp               |
+        |  write_shader / screenshot  <----------+
+        +--> shaders/*.glsl  --hot-reload--> window
+```
+
+The viewer hosts the MCP server itself (Streamable HTTP), so tools render
+with the window's own GL context. `shadertoy-console.exe --mcp` remains
+available as a standalone headless stdio server (architecture A) for
+headless/CI use.
 
 ## Building
 
-Requires a MinGW-w64 cross-compiler (w64devkit), SDL2, and libjq.
+Requires SDL2 and libjq via pkg-config (w64devkit on Windows:
 
-```sh
-make            # release build with -mwindows (GUI subsystem)
-make console    # console-subsystem build — use this for --mcp
-make DEBUG=1    # -O0 -g, no stripping
-make SAN=1      # additionally enable AddressSanitizer (opt-in; some
-                # toolchains such as w64devkit ship no libasan)
+```
+pacman -S mingw-w64-x86_64-SDL2 mingw-w64-x86_64-jq
 ```
 
-Two binaries are produced in `build/`:
+if using MSYS2).
 
-| Binary | Subsystem | Use |
-|---|---|---|
-| `shadertoy.exe` | Windows GUI (`-mwindows`) | interactive viewer |
+```sh
+make            # release build -> build/shadertoy(.exe); viewer + MCP HTTP
+make console    # console-subsystem build -> build/shadertoy-console(.exe); standalone --mcp
+make mcp        # alias for make console
+make DEBUG=1    # -O0 -g, no strip -> build/shadertoy-debug(.exe), build/shadertoy-debug-console(.exe)
+make SAN=1      # opt-in AddressSanitizer (unsupported under MSVCRT-based toolchains)
+```
+
+Two binaries appear in `build/`:
+
+| Binary              | Subsystem    | Use |
+|---------------------|-----------|---|
+| `shadertoy.exe`     | Windows GUI (`-mwindows`)  | interactive viewer |
 | `shadertoy-console.exe` | Console | `--mcp` server, or viewer with stdout |
 
-The GUI build has stdout detached, so **use the console build for MCP**.
-`make mcp` is an alias for `make console`.
+The viewer hosts MCP over HTTP, so the GUI build needs no console. The
+console build is only required for standalone stdio `--mcp`.
 
 ### Dependencies (via pkg-config)
 
@@ -34,8 +51,8 @@ The GUI build has stdout detached, so **use the console build for MCP**.
 | libjq     | JSON parsing/serialization (MCP)|
 | OpenGL    | Shader rendering                |
 
-If libjq is missing, the build warns and produces a viewer without MCP
-support.
+If libjq is missing, the viewer still builds; `--mcp` exits with an error
+asking for libjq instead of failing the build.
 
 ## Usage
 
@@ -48,8 +65,9 @@ build/shadertoy.exe            # browse everything in shaders/
 ```
 
 Passing `-s` loads exactly that one shader and prints a note that arrow-key
-browsing is disabled (the cycle keys have nothing to cycle through). Omit `-s`
-to browse the whole directory.
+browsing is disabled. Without `-s` the viewer loads every `.glsl` starting on
+the first that compiles; `←`/`→`, `↑`/`↓`, `PageUp`/`PageDown` cycle; `q`/`Esc`
+quits.
 
 ```
 Usage: shadertoy [OPTIONS] [SHADER_PATH]
@@ -66,40 +84,45 @@ Options:
   -2, --texture2 <path>   texture for iChannel2
   -3, --texture3 <path>   texture for iChannel3
   -k, --keyboard <ch>     bind keyboard state texture to iChannel<ch>
-  -m, --mcp               run as an MCP server on stdio
-      --mcp-lsp           run as MCP server, reply with Content-Length framing
+  -m, --mcp               run as a standalone headless MCP server on stdio
+      --mcp-lsp           MCP server replying with Content-Length framing
+  -p, --mcp-port <n>      viewer MCP HTTP port (default: 8642, 0 disables)
   -?, --help              show this help
 ```
 
-> **`-h` is `--height`, not help.** Use `-?` or `--help`. A bare `-h` with no
-> numeric value prints an explanatory error instead of the usage text.
+Channel textures auto-detect next to the shader: `foo.glsl` picks up
+`foo.0.png`, `foo.1.jpg`, etc. (if not explicitly set with `--texture<ch>`).
+The viewer and the MCP renderer use the same loader.
 
-With no arguments the viewer loads every `.glsl` in `./shaders`, starting on
-the first one that compiles. `←`/`→`, `↑`/`↓`, `PageUp`/`PageDown`, space and
-backspace cycle through shaders; `q` or `Esc` quits. Uncompilable shaders are
-skipped with a message rather than aborting the session.
+### MCP server mode (viewer-hosted, default)
 
-The shader list is sized dynamically — there is no cap on how many shaders a
-directory may contain. Paths are sorted, so indices in the viewer and in
-`list_shaders` agree with each other and with `ls`.
+1. Start the viewer from the project root (it serves MCP automatically):
 
-Channel textures are auto-detected next to the shader: `foo.glsl` picks up
-`foo.0.png`, `foo.1.jpg`, etc. for `iChannel0..3`.
+   ```sh
+   build\shadertoy.exe "shaders\Paralax Cloud.glsl"
+   ```
 
-### MCP server mode
+2. Point the MCP client at `http://127.0.0.1:8642/mcp` (config below).
+3. Edits appear live; tools run on the viewer's main thread between frames,
+   so `screenshot` with `"window": true` captures exactly what is on screen.
+
+Only one viewer can own the port: a second instance exits with a clear
+error rather than silently sharing. `--mcp-port 0` disables the server;
+`--mcp-port <n>` moves it. The bound port and pid are written to
+`build/.shadertoy-mcp`, and diagnostics go to `build/shadertoy-mcp.log`
+(the GUI subsystem has no console). Quitting the viewer stops the server.
+
+The **standalone headless server** (architecture A) is still available for
+CI or machines with no display; it speaks stdio and never shows a window:
 
 ```sh
-build/shadertoy-console.exe --mcp          # newline-delimited JSON (default)
-build/shadertoy-console.exe --mcp --mcp-lsp  # Content-Length framing
+build/shadertoy-console.exe --mcp              # one JSON object per line
+build/shadertoy-console.exe --mcp --mcp-lsp    # Content-Length framed replies
 ```
 
-It speaks JSON-RPC 2.0 over stdio. **The default framing is the MCP stdio
-transport: one JSON object per line.** That is what Claude Desktop, VS Code
-and other MCP clients send. Incoming `Content-Length:` framing is also
-accepted, and `--mcp-lsp` switches *replies* to that style for LSP-shaped
-clients.
-
-Example session:
+Incoming `Content-Length:` framing is accepted either way; `--mcp-lsp` makes
+**replies** Content-Length framed for LSP-shaped clients. Launch it from the
+project root so `shaders/` resolves. Example:
 
 ```sh
 printf '%s\n' \
@@ -108,54 +131,82 @@ printf '%s\n' \
   | build/shadertoy-console.exe --mcp
 ```
 
+### opencode / Claude / VS Code config
+
+For the viewer-hosted server (start the viewer first):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "shadertoy": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8642/mcp",
+      "enabled": true
+    }
+  }
+}
+```
+
+For the standalone server, use `"type": "local"` with
+`"command": ["build/shadertoy-console.exe", "--mcp"]` instead.
+
 ## MCP Tools
 
-| Tool            | Requires GL | Description |
-|-----------------|-------------|-------------|
-| `list_shaders`  | No          | List all `.glsl` files in `shaders/` |
-| `read_shader`   | No          | Read shader source by index |
-| `get_shader_info` | No        | Metadata (name, path, line count, byte size) |
-| `compile_shader`| Yes         | Compile-check a shader, returns compiler log |
-| `get_fps`       | Yes         | Benchmark rendering FPS for a shader |
-| `screenshot`    | Yes         | Render a frame, return as base64-encoded **PNG** |
-| `run_shaders`   | Yes         | Run shader with advancing time, report FPS, optional frame capture (PNG) |
-| `write_shader`  | No          | Create a new `.glsl` shader file in `shaders/` |
-| `reload_shaders`| No          | Rescan `shaders/` directory |
+All tools accept a shader id as `name` (plain filename, with or without
+`.glsl`, so use `name: "2D Clouds.glsl"`) or `index` (0-based, from
+`list_shaders`) — whichever is most convenient.
 
-Images are returned as PNG (`image/png`), which MCP clients can display
-directly.
+| Tool | GL required | Purpose |
+|------|-------------|---------|
+| `list_shaders` | No | Files in `shaders/` (text + JSON in `structuredContent.items`) |
+| `read_shader` | No | Full source of a shader |
+| `get_shader_info` | No | Name, path, line count, bytes |
+| `compile_shader` | Yes | Compile-only check; compiler log if failing |
+| `get_fps` | Yes | Benchmark: N frames at fixed 16 ms steps |
+| `screenshot` | Yes | Base64 PNG: offscreen frame at time `t`, or `window: true` for the live viewer backbuffer |
+| `run_shaders` | Yes | Advance time over N frames, FPS stats; optional PNG |
+| `write_shader` | No\* | **Write + immediately compile-check in one call** |
+| `update_shader` | No\* | Same, updating an existing shader (by name/index) |
+| `reload_shaders` | No | Rescan `shaders/` |
+| `load_shader` | Yes | Switch the visible viewer to another shader (viewer-hosted only) |
+| `get_viewer_status` | No | Current shader, index, window size, FPS (viewer-hosted only) |
 
-An unknown tool name is reported as a normal tool error
-(`isError: true`) rather than a JSON-RPC protocol error.
+\* write/update try to compile; if the GL context cannot be created they say
+`Compile check: skipped`, and the write still happens.
 
-### Tool parameters
+`load_shader`, `get_viewer_status`, and `screenshot {"window": true}` return
+an `isError` tool result when called against the standalone `--mcp` server.
 
-**get_fps:** `index` (integer, required), `frames` (integer, default 60),
-`width` (integer, default 640), `height` (integer, default 480). Renders
-`frames` frames with fixed 16 ms steps and reports throughput.
+### The agent edit loop
 
-**run_shaders:** `index` (integer, required), `frames` (integer, default 60),
-`width` (integer, default 320), `height` (integer, default 240),
-`duration` (number, default 1.0, seconds), `captureFrame` (boolean, default false).
+The big design point for agent interactivity: `write_shader` and
+`update_shader` **write AND compile in the same round trip**. A bad shader
+comes back with `isError: true` and the compiler log inline; the agent can
+immediately call `screenshot` and see the result, no bureaucracy in
+between.
 
-**screenshot:** `index` (required), `width` (default 640), `height` (default 480),
-`time` (number, default 0).
+Params: every tool takes the shader id plus view/resolution options that
+default sensibly (`frames`, `width`, `height`, `time`, `duration`,
+`captureFrame`). `write_shader(name, content)` uses a plain filename with
+the `.glsl` suffix appended when missing.
 
-**write_shader:** `name` (string, required), `content` (string, required).
-`name` must be a plain filename — path separators, `..` and drive/URI
-prefixes are rejected so writes cannot escape `shaders/`.
+An unknown tool name is reported as a normal tool error (`isError: true`)
+rather than a JSON-RPC protocol error.
 
 ## Project structure
 
 ```
 src/
-  main.c          — SDL2 viewer, CLI parsing, --mcp dispatch
-  mcp.c           — MCP server: JSON-RPC framing, tool implementations
-  mcp.h           — MCP entry point + framing selection
-  shader_common.c — shared GLSL header/footer, program build, uniforms
-  shader_common.h — shader_common API
+  main.c          — SDL2 viewer (window, input, hot reload); hosts the
+                    viewer MCP hooks and --mcp dispatch
+  mcp.c           — MCP server: JSON-RPC/tools, stdio framing, HTTP transport
+  mcp.h           — mcp_run(), viewer hooks, HTTP lifecycle
+  shader_common.c — shared GLSL header/footer, program builder, uniforms,
+                    file IO, channel texture loading (single source of truth)
+  shader_common.h — its API
   shader_list.c   — shared dynamic shader-directory scanner
-  shader_list.h   — shader_list API
+  shader_list.h   — its API
   config.h        — CLI options table
 glad/       — GLAD OpenGL loader (desktop GL)
 glad_es/    — GLAD OpenGL ES loader (ARM / aarch64)
@@ -164,65 +215,52 @@ shaders/    — GLSL fragment shaders (.glsl) + optional <name>.<ch>.png texture
 Makefile    — GNU Make build
 ```
 
-`shader_common.c` is the single source of truth for what a Shadertoy shader
-receives: the `#version` line, the fullscreen-quad vertex shader, the injected
-`iXXX` uniform header, the `mainImage()` footer, and the per-frame uniform
-upload. Both the viewer and the MCP renderer call it, so a shader cannot render
-differently depending on which code path compiled it. If you add a uniform,
-add it there.
+### What a Shadertoy shader is (per this project)
 
-### How the shader wrapper works
-
-Every `.glsl` file is a bare Shadertoy body — just `mainImage()` and helpers.
-It is wrapped as:
+Every `.glsl` is a bare Shadertoy body (`mainImage()` and helpers). It is
+wrapped by `shader_common.c`:
 
 ```glsl
 #version 330 core          // or 300 es on GLES
 precision highp float;
 in  vec2  vFragCoord;
-uniform vec3  iResolution;  // ... iTime, iTimeDelta, iFrame, iFrameRate,
-uniform vec4  iMouse;       //     iMouse, iDate, iSampleRate,
-uniform sampler2D iChannel0; //    iChannel0..3, iChannelResolution[4],
-                            //     iChannelTime[4]
-out vec4 fragColor;
+uniform vec3  iResolution;   // ... iTime, iTimeDelta, iFrame, iFrameRate,
+uniform vec4  iMouse;        //     iMouse, iDate, iSampleRate, ...
+uniform sampler2D iChannel0; //     iChannel0..3, iChannelResolution, iChannelTime
+out vec4  fragColor;
 
-<your .glsl file verbatim>
+<your .glsl verbatim>
 
 void main() { mainImage(fragColor, vFragCoord); }
 ```
 
+The wrapper is shared by the viewer and every MCP render path, so time-only
+shaders render the same offscreen as in the window. Headless renders have
+`iMouse = 0` and no `iDate`, so interactive or date-dependent shaders differ.
+
 ## Headless rendering
 
-The MCP server creates a hidden, offscreen SDL/OpenGL context on demand
-for tools that need GL (compile_shader, get_fps, screenshot, run_shaders).
-No GPU/display access is required at startup; the context is initialized
-lazily and cleaned up on exit.
-
-Note that headless rendering uses the same wrapper and the same uniform
-uploader as the viewer, and auto-detects `<shader>.<ch>.<ext>` channel textures
-the same way. Channels without a texture are bound to a 1×1 black texture and
-reported as zero in `iChannelResolution`. Because there is no window, `iMouse`
-is always zero in headless renders.
+The standalone server (`--mcp`) creates a hidden SDL/GL context lazily, at
+tool-call time. The viewer-hosted server reuses the window's context instead.
+If no GPU/display is available the GL tools fail with a clean message;
+read/write/list tools keep working. Channels without a texture get a 1x1
+black texture and are reported as zero in `iChannelResolution`; offscreen
+renders have `iMouse = 0` and no `iDate`, so both stay at their GLSL
+defaults. `screenshot {"window": true}` in viewer mode captures the actual
+frame, including mouse/keyboard/date state.
 
 ## Known limitations
 
-These are real, currently unfixed issues — not rough edges in the docs.
-
-### `make SAN=1` does not work on w64devkit
-
-AddressSanitizer is opt-in via `SAN=1` and is **not** part of the default
-debug build. It requires a toolchain that ships `libasan`; the bundled
-w64devkit MinGW does not, so `make SAN=1` fails at link time with
-`cannot find -lasan`. This is intentional — a hard dependency would have
-broken `make DEBUG=1` — but it means there is currently no working memory
-sanitizer path on the recommended Windows toolchain. On a Linux/glibc host
-(or MSYS2 with `mingw-w64-x86_64-gcc` plus the sanitizer runtime) `SAN=1`
-works as expected.
-
-### Minor
-
-- `get_fps` renders with a fixed 16 ms timestep regardless of wall-clock time,
-  so its numbers are throughput measurements, not a frame-accurate simulation.
-- Screenshots are encoded by a small built-in PNG writer (zlib stored blocks,
-  filter 0). Output is valid but uncompressed — expect a larger file than a
-  normal PNG encoder would produce.
+- Offscreen screenshots (the default, and the only kind in `--mcp` mode) have
+  `iMouse = 0`, no `iDate`, and no keyboard texture. Use `window: true` in
+  viewer mode to capture the real frame.
+- The viewer-hosted server binds `127.0.0.1` only; remote MCP clients need a
+  local client or a tunnel. Quitting the viewer disconnects the client.
+- `get_fps` renders with a fixed 16 ms timestep, so numbers are throughput
+  measurements, not frame-accurate simulation.
+- PNG output is a small built-in encoder (zlib stored blocks). Valid but
+  uncompressed.
+- `make SAN=1` needs libasan; MSVCRT-based toolchains (w64devkit) don't
+  ship it. On Linux or MSYS2 clang64/mingw toolchains it works.
+- The MCP server resolves `shaders/` relative to its own CWD; run it with
+  the project directory as the working directory (MCP clients do this).

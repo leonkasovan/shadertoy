@@ -112,18 +112,18 @@ const vec3 _LightDir = vec3(-0.23047, 0.87328, -0.42927) ;
 const float _Brightness = 0.40000 ;
 const float _Contrast = 0.83000 ;
 const float _Saturation = 1.21000 ;
-const vec3 _SunStar = vec3(14.7, 1.47, 0.1) ;
+const vec3 _SunStar = vec3(1.47, 1.47, 0.1) ;
 const float _SunSize = 26.00000 ;
 const float _SunScale = 15.00000 ;
 const float _ExposureOffset = 11.10000 ;
 const float _ExposurePower = 0.52000 ;
 const float _ExposureStrength = 0.09000 ;
 const RGB _SunColor = RGB(1, 0.95441, 0.77206) ;
-const RGB _Zenith = RGB(0.77941, 0.5898, 0.41263) ;
+const RGB _Zenith = RGB(0.20, 0.45, 0.85) ;
 const float _ZenithFallOff = 2.36000 ;
 const RGB _Nadir = RGB(1, 0.93103, 0) ;
 const float _NadirFallOff = 1.91000 ;
-const RGB _Horizon = RGB(0.96324, 0.80163, 0.38954) ;
+const RGB _Horizon = RGB(0.72, 0.84, 0.97) ;
 const vec3 _CharacterAOParams = vec3(0.03, 7.36, 0) ;
 const RGB _CharacterMainColor = RGB(0.60294, 0.1515, 0.062067) ;
 const RGB _CharacterTerrainCol = RGB(0.35294, 0.16016, 0.12197) ;
@@ -136,7 +136,7 @@ const float _CharacterFreScale = 1.77000 ;
 const float _CharacterFrePower = 3.84000 ;
 const float _CharacterFogScale = 4.55000 ;
 const float _CloudTransparencyMul = 0.90000 ;
-const RGB _CloudCol = RGB(1, 0.84926, 0.69853) ;
+const RGB _CloudCol = RGB(0.82, 0.90, 1.0) ;
 const RGB _BackCloudCol = RGB(0.66176, 0.64807, 0.62284) ;
 const RGB _CloudSpecCol = RGB(0.17647, 0.062284, 0.062284) ;
 const RGB _BackCloudSpecCol = RGB(0.11029, 0.05193, 0.020275) ;
@@ -906,19 +906,19 @@ float sdCloud( in vec3 pos, vec3 cloudPos, float rad, float spread, float phaseO
 vec2 sdClouds( in vec3 pos )
 {
 	// Two layers of clouds. A layer in front of the big pyramid
-    float c1 = sdCloud( pos, _FrontCloudsPos, _FrontCloudParams.x, _FrontCloudParams.y, _FrontCloudParams.z, _CloudGlobalParams );
-    float c2 = sdCloud( pos, _FrontCloudsPos + _FrontCloudsOffsetA, _FrontCloudParamsA.x, _FrontCloudParamsA.y, _FrontCloudParamsA.z, _CloudGlobalParams );
-    float c3 = sdCloud( pos, _FrontCloudsPos + _FrontCloudsOffsetB, _FrontCloudParamsB.x, _FrontCloudParamsB.y, _FrontCloudParamsB.z, _CloudGlobalParams);
+    float c1 = sdCloud( pos - vec3(iTime * 0.50, 0.0, 0.0), _FrontCloudsPos, _FrontCloudParams.x, _FrontCloudParams.y, _FrontCloudParams.z, _CloudGlobalParams );
+    float c2 = sdCloud( pos - vec3(iTime * 0.62, 0.0, 0.0), _FrontCloudsPos + _FrontCloudsOffsetA, _FrontCloudParamsA.x, _FrontCloudParamsA.y, _FrontCloudParamsA.z, _CloudGlobalParams );
+    float c3 = sdCloud( pos - vec3(iTime * 0.44, 0.0, 0.0), _FrontCloudsPos + _FrontCloudsOffsetB, _FrontCloudParamsB.x, _FrontCloudParamsB.y, _FrontCloudParamsB.z, _CloudGlobalParams);
     float frontClouds = min(c3, min(c1, c2));
 
     // This plane hides the empty spaces between the front cloud spheres. Not needed
     // for back spheres, they are covered by front spheres
-  	float mainPlane = length(pos.z - _FrontCloudsPos.z) / _CloudGlobalParams.x + (pos.y - _PlaneParams.y  + sin(_PlaneParams.x + pos.x * 0.23 ) * _PlaneParams.z);// - rad;
+  	float mainPlane = length(pos.z - _FrontCloudsPos.z) / _CloudGlobalParams.x + (pos.y - _PlaneParams.y  + sin(_PlaneParams.x + (pos.x - iTime * 0.50) * 0.23 ) * _PlaneParams.z);// - rad;
   	frontClouds = min(mainPlane * _CloudGlobalParams.x, frontClouds);
 
 	// Second layer behind the big Pyramid
-    float c4 = sdCloud( pos, _BackCloudsPos, _BackCloudParams.x, _BackCloudParams.y, _BackCloudParams.z, _CloudBackGlobalParams );
-    float c5 = sdCloud( pos, _BackCloudsPos + _BackCloudsOffsetA, _BackCloudParamsA.x, _BackCloudParamsA.y, _BackCloudParamsA.z, _CloudBackGlobalParams );
+    float c4 = sdCloud( pos - vec3(iTime * 0.16, 0.0, 0.0), _BackCloudsPos, _BackCloudParams.x, _BackCloudParams.y, _BackCloudParams.z, _CloudBackGlobalParams );
+    float c5 = sdCloud( pos - vec3(iTime * 0.20, 0.0, 0.0), _BackCloudsPos + _BackCloudsOffsetA, _BackCloudParamsA.x, _BackCloudParamsA.y, _BackCloudParamsA.z, _CloudBackGlobalParams );
     float backClouds = min(c4,c5);
     return min_mat(vec2(frontClouds,MAT_FRONT_CLOUDS), vec2(backClouds,MAT_BACK_CLOUDS));
 }
