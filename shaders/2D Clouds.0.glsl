@@ -8,7 +8,7 @@ const float skytint = 0.5;
 const vec3 skycolour1 = vec3(0.2, 0.4, 0.6);
 const vec3 skycolour2 = vec3(0.4, 0.7, 1.0);
 
-const mat2 m = mat2( 1.6,  1.2, -1.2,  1.6 );
+const mat2 m = mat2( 1.6,  0.0, 0.0, 1.6 );
 
 vec2 hash( vec2 p ) {
 	p = vec2(dot(p,vec2(127.1,311.7)), dot(p,vec2(269.5,183.3)));
@@ -49,11 +49,13 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
     //ridged noise shape
 	float r = 0.0;
 	uv *= cloudscale;
-    uv -= q - time;
+    uv -= q;
+    uv.x += time;
     float weight = 0.8;
     for (int i=0; i<8; i++){
 		r += abs(weight*noise( uv ));
-        uv = m*uv + time;
+        uv = m*uv;
+        uv.x += time;
 		weight *= 0.7;
     }
     
@@ -61,11 +63,13 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
 	float f = 0.0;
     uv = p*vec2(iResolution.x/iResolution.y,1.0);
 	uv *= cloudscale;
-    uv -= q - time;
+    uv -= q;
+    uv.x += time;
     weight = 0.7;
     for (int i=0; i<8; i++){
 		f += weight*noise( uv );
-        uv = m*uv + time;
+        uv = m*uv;
+        uv.x += time;
 		weight *= 0.6;
     }
     
@@ -76,11 +80,13 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
     time = iTime * speed * 2.0;
     uv = p*vec2(iResolution.x/iResolution.y,1.0);
 	uv *= cloudscale*2.0;
-    uv -= q - time;
+    uv -= q;
+    uv.x += time;
     weight = 0.4;
     for (int i=0; i<7; i++){
 		c += weight*noise( uv );
-        uv = m*uv + time;
+        uv = m*uv;
+        uv.x += time;
 		weight *= 0.6;
     }
     
@@ -89,11 +95,13 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
     time = iTime * speed * 3.0;
     uv = p*vec2(iResolution.x/iResolution.y,1.0);
 	uv *= cloudscale*3.0;
-    uv -= q - time;
+    uv -= q;
+    uv.x += time;
     weight = 0.4;
     for (int i=0; i<7; i++){
 		c1 += abs(weight*noise( uv ));
-        uv = m*uv + time;
+        uv = m*uv;
+        uv.x += time;
 		weight *= 0.6;
     }
 	
