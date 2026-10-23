@@ -151,6 +151,19 @@ For the viewer-hosted server (start the viewer first):
 For the standalone server, use `"type": "local"` with
 `"command": ["build/shadertoy-console.exe", "--mcp"]` instead.
 
+For pi (`~/.pi/agent/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "shadertoy": {
+      "url": "http://127.0.0.1:8642/mcp",
+      "description": "Shadertoy shader viewer/editor MCP server"
+    }
+  }
+}
+```
+
 ## MCP Tools
 
 All tools accept a shader id as `name` (plain filename, with or without
