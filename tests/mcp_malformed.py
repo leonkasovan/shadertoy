@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Regression test: malformed JSON-RPC messages must not kill the server.
 
-Runs the standalone stdio server, so no display or GPU is needed. Build with
-`make console` first.
+The MCP server is HTTP-only and hosted by the viewer, so this starts
+`build/shadertoy(.exe)` on a random port (like mcp_viewer_smoke.py) and
+POSTs the bad payloads at http://127.0.0.1:<port>/mcp. Requires a
+display/GPU, because the viewer always opens a window.
 
 libjq asserts when jv_object_get() is called on a non-object, which used to
 abort the process on a top-level array/string/number/bool/null. This test
@@ -12,16 +14,42 @@ request to prove the server is still alive.
 
 import json
 import os
+import socket
 import subprocess
 import sys
+import time
+import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "build",
-                   "shadertoy-console.exe" if os.name == "nt"
-                   else "shadertoy-console")
+                   "shadertoy.exe" if os.name == "nt" else "shadertoy")
 
 if not os.path.exists(EXE):
-    sys.exit("build the console server first: make console")
+    sys.exit("build the viewer first: make")
+
+START_REL = os.path.join("build", "mcp_malformed_start.glsl")
+START = os.path.join(ROOT, START_REL)
+
+with open(START, "w") as f:
+    f.write("void mainImage(out vec4 c, in vec2 p){ c = vec4(0.5); }\n")
+
+probe = socket.socket()
+probe.bind(("127.0.0.1", 0))
+port = probe.getsockname()[1]
+probe.close()
+
+proc = subprocess.Popen([EXE, "-s", START_REL, "-p", str(port)], cwd=ROOT,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+url = f"http://127.0.0.1:{port}/mcp"
+
+
+def post(payload):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.status, resp.read()
+
 
 # (message, expected response id, expected error code)
 cases = [
@@ -35,31 +63,60 @@ cases = [
     ("{not json", None, -32700),
 ]
 
-valid = '{"jsonrpc":"2.0","id":11,"method":"tools/list"}'
-notification = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
-payload = "\n".join([m for m, _, _ in cases] + [valid, notification]) + "\n"
+try:
+    for _ in range(50):
+        try:
+            status, raw = post({"jsonrpc": "2.0", "id": 1,
+                                "method": "initialize", "params": {}})
+            break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        sys.exit("viewer MCP server did not start")
+    assert status == 200, status
 
-proc = subprocess.run([EXE, "--mcp"], input=payload.encode(), cwd=ROOT,
-                      capture_output=True, timeout=30)
-stderr = proc.stderr.decode(errors="replace")
-if proc.returncode != 0:
-    sys.exit(f"server exited with {proc.returncode} on malformed input\n"
-             f"stderr:\n{stderr}")
+    # Raw bodies, not wrapped by post(), so JSON parse errors survive.
+    for message, want_id, want_code in cases:
+        req = urllib.request.Request(
+            url, data=message.encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            assert resp.status == 200, (message, resp.status)
+            raw = resp.read()
+        obj = json.loads(raw)
+        error = obj.get("error")
+        assert obj.get("id") == want_id, (message, obj)
+        assert error and error.get("code") == want_code, (message, obj)
 
-lines = [line for line in proc.stdout.splitlines() if line.strip()]
-expected = len(cases) + 1
-if len(lines) != expected:
-    sys.exit(f"expected {expected} responses (notification is silent), "
-             f"got {len(lines)}\nstdout:\n{proc.stdout!r}\nstderr:\n{stderr}")
+    # Notifications get 202 and no body.
+    status, body = post({"jsonrpc": "2.0",
+                         "method": "notifications/initialized"})
+    assert status == 202 and body == b"", (status, body)
 
-for i, (message, want_id, want_code) in enumerate(cases):
-    obj = json.loads(lines[i])
-    error = obj.get("error")
-    assert obj.get("id") == want_id, (message, obj)
-    assert error and error.get("code") == want_code, (message, obj)
-
-final = json.loads(lines[len(cases)])
-assert final.get("id") == 11, final
-assert "tools" in final.get("result", {}), final
+    # Still alive after all of the above.
+    status, raw = post({"jsonrpc": "2.0", "id": 11, "method": "tools/list"})
+    final = json.loads(raw)
+    assert status == 200, status
+    assert final.get("id") == 11, final
+    assert "tools" in final.get("result", {}), final
+finally:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    lock = os.path.join(ROOT, "build", ".shadertoy-mcp")
+    stale = False
+    try:
+        with open(lock) as f:
+            stale = f.read().split()[0] == str(port)
+    except (OSError, IndexError):
+        pass
+    if stale:
+        os.remove(lock)
+    try:
+        os.remove(START)
+    except OSError:
+        pass
 
 print("malformed JSON-RPC regression test OK")

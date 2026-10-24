@@ -26,5 +26,12 @@ compile_commands.json
 # Local agent scratch state (keep machine-specific notes out of the repo)
 .commandcode/
 
+# Agent/editor local state (machine-specific; never commit)
+.pi/
+.codegraph/
+
+# Codebase-memory index artifacts (persistence:true writes .codebase-memory/)
+.codebase-memory/
+
 # Accidental output from a malformed `mkdir -p` invocation
 -p/

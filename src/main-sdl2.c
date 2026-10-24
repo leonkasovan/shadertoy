@@ -24,16 +24,15 @@
 #include "mcp.h"
 #ifdef MCP_UNAVAILABLE
 /* Built without libjq (Makefile sets this define): keep the viewer building
- * and make --mcp fail with a clear message instead of a link error. */
-int mcp_run(void)
+ * with MCP disabled instead of failing at link time. */
+int mcp_viewer_start(int port, const mcp_viewer_hooks *hooks)
 {
-    fprintf(stderr, "Error: this build has no MCP support; install libjq "
-                    "(e.g. MSYS2: pacman -S mingw-w64-x86_64-jq) and rebuild.\n");
+    (void)hooks;
+    if (port > 0)
+        fprintf(stderr, "MCP disabled: this build has no libjq "
+                        "(e.g. MSYS2: pacman -S mingw-w64-x86_64-jq).\n");
     return 1;
 }
-int mcp_set_framing(int lsp) { (void)lsp; return 0; }
-int mcp_viewer_start(int port, const mcp_viewer_hooks *hooks)
-{ (void)port; (void)hooks; return 1; }
 void mcp_viewer_poll(void) {}
 void mcp_viewer_stop(void) {}
 int mcp_viewer_port(void) { return 0; }
@@ -403,8 +402,6 @@ int main(int argc, char **argv)
     int window_y = SDL_WINDOWPOS_UNDEFINED;
     int fullscreen = 0;
     int bindKeyboard = -1;
-    int mcp_mode = 0;
-    int mcp_lsp  = 0;
     int mcp_port = 8642;
 
     /* parse command line options via getopt_long (from config.h) */
@@ -424,8 +421,6 @@ int main(int argc, char **argv)
         case 'x': { int v = atoi(optarg); if (v >= 0) window_x = v; break; }
         case 'y': { int v = atoi(optarg); if (v >= 0) window_y = v; break; }
         case 'k': { int v = atoi(optarg); if (v >= 0 && v < 4) bindKeyboard = v; break; }
-        case 'm': mcp_mode = 1; break;
-        case 'M': mcp_mode = 1; mcp_lsp = 1; break;
         case 'p': {
             int v = atoi(optarg);
             if (v >= 0 && v <= 65535) mcp_port = v;
@@ -457,11 +452,6 @@ int main(int argc, char **argv)
                 "  -2, --texture2 <path>   texture for iChannel2\n"
                 "  -3, --texture3 <path>   texture for iChannel3\n"
                 "  -k, --keyboard <ch>     bind keyboard state texture to iChannel<ch>\n"
-                "  -m, --mcp               run as a standalone MCP server on stdio\n"
-                "                            (one JSON message per line; accepts\n"
-                "                             Content-Length input too)\n"
-                "      --mcp-lsp           MCP server replying with Content-Length\n"
-                "                             framing\n"
                 "  -p, --mcp-port <n>      viewer MCP HTTP port (default: 8642,\n"
                 "                             0 disables the server)\n"
                 "  -?, --help              show this help\n\n"
@@ -475,12 +465,6 @@ int main(int argc, char **argv)
      * -s <path> wins if both are given. */
     if (optind < argc)
         shader_path = argv[optind];
-
-    if (mcp_mode) {
-        /* Standalone headless server: never touches the window loop. */
-        mcp_set_framing(mcp_lsp);
-        return mcp_run();
-    }
 
     if (bindKeyboard >= 0 && g_tex_cli[bindKeyboard]) {
         fprintf(stderr, "Error: cannot bind texture and keyboard to the same channel.\n");

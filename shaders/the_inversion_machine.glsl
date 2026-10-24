@@ -92,8 +92,14 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
 	vec3 dir=normalize(vec3(uv,1.));
 	rot=mat2(cos(t),sin(t),-sin(t),cos(t));
 	dir.xy=dir.xy*rot;
-	float col=raymarch(from,dir,fragCoord); 
-	col=pow(col,1.25)*clamp(60.-iTime,0.,1.);
+	float col=raymarch(from,dir,fragCoord);
+	// Original line faded the image to black once iTime passed 60 s
+	// (col *= clamp(60.-iTime,0.,1.) == 0), so the shader looked like it
+	// rendered nothing after the first minute. Loop the intro ramp over 60 s
+	// and floor the multiplier so the scene stays visible.
+	float fade = clamp(60.-mod(iTime,60.),0.,1.);
+	fade = mix(0.7,1.0,fade);
+	col=pow(max(col,0.),1.25)*fade;
 	fragColor = vec4(col);
 }
 

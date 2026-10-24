@@ -1,6 +1,11 @@
-# Shadertoy SDL2 — fullscreen shader viewer
-#   make          -> build/shadertoy.exe (Windows) or build/shadertoy (Linux)
-#   make DEBUG=1  -> ASan debug build
+# Shadertoy — fullscreen shader viewer
+#   make                -> SDL2 backend, build/shadertoy.exe (Windows) or
+#                          build/shadertoy (Linux)
+#   make BACKEND=glfw   -> GLFW backend, build/shadertoy-glfw(.exe)
+#   make console        -> console-subsystem viewer (keeps stdout/stderr)
+#   make glfw           -> alias for BACKEND=glfw
+#   make glfw-console   -> console-subsystem GLFW build
+#   make DEBUG=1        -> ASan debug build
 #   make clean
 #
 # On aarch64/arm64, automatically uses OpenGL ES via glad_es
@@ -11,6 +16,9 @@
 # wrappers rewrite the path at runtime), then common MSYS2 prefixes are
 # probed. Override on the command line if needed:
 #   make SDL_PREFIX=/path/to/prefix
+#
+# The GLFW backend still links SDL2: mcp.c uses SDL for its HTTP thread,
+# mutexes and condition variables.
 
 CC        ?= gcc
 ifeq ($(DEBUG),1)
@@ -113,23 +121,49 @@ else
 endif
 endif
 
-OUTDIR     := build
-ifeq ($(DEBUG),1)
-TARGET     := $(OUTDIR)/shadertoy-debug$(BINEXT)
-CONSOLE    := $(OUTDIR)/shadertoy-debug-console$(BINEXT)
+# ------------------------------------------------------------------
+# Viewer backend: SDL2 (default) or GLFW
+# ------------------------------------------------------------------
+BACKEND ?= sdl2
+ifeq ($(BACKEND),sdl2)
+  MAIN_SRC    := src/main-sdl2.c
+  TARGET_TAG  :=
+  # pkg-config/sdl2-config also hand us -Dmain=SDL_main, which is required by
+  # SDL2main on Windows but must not leak into the GLFW main file.
+  BACKEND_CFLAGS := $(SDL_CFLAGS)
+  BACKEND_LIBS   := $(SDL_LIBS)
+else ifeq ($(BACKEND),glfw)
+  MAIN_SRC    := src/main-glfw.c
+  TARGET_TAG  := -glfw
+  GLFW_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
+  GLFW_LIBS   := $(shell pkg-config --libs glfw3 2>/dev/null)
+  ifeq ($(GLFW_LIBS),)
+    $(error GLFW not found via pkg-config; install it (e.g. MSYS2: pacman -S mingw-w64-x86_64-glfw) or build the default SDL2 backend)
+  endif
+  BACKEND_CFLAGS := $(filter-out -Dmain=SDL_main,$(SDL_CFLAGS)) $(GLFW_CFLAGS)
+  BACKEND_LIBS   := $(SDL_LIBS) $(GLFW_LIBS)
 else
-TARGET     := $(OUTDIR)/shadertoy$(BINEXT)
-CONSOLE    := $(OUTDIR)/shadertoy-console$(BINEXT)
+  $(error Unknown BACKEND '$(BACKEND)'; use BACKEND=sdl2 or BACKEND=glfw)
 endif
 
-SRCS       := src/main.c src/shader_common.c src/shader_list.c $(GLAD_SRC)
+OUTDIR     := build
+ifeq ($(DEBUG),1)
+TARGET     := $(OUTDIR)/shadertoy$(TARGET_TAG)-debug$(BINEXT)
+CONSOLE    := $(OUTDIR)/shadertoy$(TARGET_TAG)-debug-console$(BINEXT)
+else
+TARGET     := $(OUTDIR)/shadertoy$(TARGET_TAG)$(BINEXT)
+CONSOLE    := $(OUTDIR)/shadertoy$(TARGET_TAG)-console$(BINEXT)
+endif
+
+SRCS       := $(MAIN_SRC) src/shader_common.c src/shader_list.c $(GLAD_SRC)
 
 # MCP (Model Context Protocol) support via libjq
 JQ_CFLAGS  := $(shell pkg-config --cflags libjq 2>/dev/null)
 JQ_LIBS    := $(shell pkg-config --libs libjq 2>/dev/null)
 ifeq ($(JQ_LIBS),)
   JQ_ENABLED := 0
-  # Compile-time flag so main.c can stub mcp_run() instead of failing at link.
+  # Compile-time flag so the viewer can stub the MCP entry points instead of
+  # failing at link time.
   JQ_CFLAGS  := -DMCP_UNAVAILABLE
   $(warning libjq not found via pkg-config: building WITHOUT MCP support.)
   $(warning Install it, e.g. MSYS2: pacman -S mingw-w64-x86_64-jq)
@@ -140,25 +174,33 @@ endif
 OBJS       := $(patsubst %.c,%.o,$(SRCS))
 
 # Console builds must not link the Windows GUI subsystem, otherwise stdout
-# is detached and MCP's stdio transport cannot work through a pipe.
+# is detached (useful when running the viewer from a terminal and reading its
+# log).
 ifeq ($(IS_WINDOWS),1)
-CONSOLE_SDL_LIBS := $(filter-out -mwindows,$(SDL_LIBS))
+CONSOLE_BACKEND_LIBS := $(filter-out -mwindows,$(BACKEND_LIBS))
 else
-CONSOLE_SDL_LIBS := $(SDL_LIBS)
+CONSOLE_BACKEND_LIBS := $(BACKEND_LIBS)
 endif
 
 all: $(TARGET)
 
-# Console build: same sources, Windows console subsystem. Use this for --mcp.
-console: $(CONSOLE)
+# Convenience alias: make glfw (command-line variables such as DEBUG/SAN are
+# forwarded automatically through MAKEFLAGS).
+glfw:
+	$(MAKE) BACKEND=glfw
 
-mcp: console
+glfw-console:
+	$(MAKE) BACKEND=glfw console
+
+# Console build: same sources, Windows console subsystem, so the viewer keeps
+# its stdout/stderr when launched from a terminal.
+console: $(CONSOLE)
 
 $(OUTDIR):
 	mkdir -p $@
 
 src/%.o: src/%.c
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(GL_CFLAGS) $(GLAD_INC) $(JQ_CFLAGS) -I. -c -o $@ $<
+	$(CC) $(CFLAGS) $(BACKEND_CFLAGS) $(GL_CFLAGS) $(GLAD_INC) $(JQ_CFLAGS) -I. -c -o $@ $<
 
 glad/%.o: glad/%.c
 	$(CC) $(CFLAGS) -Iglad -c -o $@ $<
@@ -167,13 +209,13 @@ glad_es/%.o: glad_es/%.c
 	$(CC) $(CFLAGS) -Iglad_es -c -o $@ $<
 
 $(TARGET): $(OBJS) | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(CONSOLE_SDL_LIBS) $(PLAT_LIBS) $(JQ_LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(BACKEND_LIBS) $(PLAT_LIBS) $(JQ_LIBS) $(LDFLAGS)
 ifndef DEBUG
 	strip -s $@
 endif
 
 $(CONSOLE): $(OBJS) | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(CONSOLE_SDL_LIBS) $(PLAT_LIBS) $(JQ_LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(CONSOLE_BACKEND_LIBS) $(PLAT_LIBS) $(JQ_LIBS) $(LDFLAGS)
 ifndef DEBUG
 	strip -s $@
 endif
@@ -181,4 +223,4 @@ endif
 clean:
 	-rm -rf build src/*.o glad/*.o glad_es/*.o
 
-.PHONY: all clean console mcp
+.PHONY: all clean console glfw glfw-console

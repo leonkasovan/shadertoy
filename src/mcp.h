@@ -3,20 +3,12 @@
 
 #include <stddef.h>
 
-/* Standalone MCP server entry point (`--mcp`).
- *
- * Reads JSON-RPC 2.0 messages from stdin until EOF and writes responses to
- * stdout. Default framing: one JSON object per line (MCP stdio transport).
- * Incoming LSP-style "Content-Length: N" framing is accepted either way;
- * mcp_set_framing(1) switches replies to Content-Length framing too.
- * Call mcp_set_framing() before mcp_run(). */
-int mcp_run(void);
+/* The MCP server is HTTP-only and viewer-hosted (architecture B): the
+ * viewer opens 127.0.0.1:<port>/mcp, and every request is executed on the
+ * viewer's main thread with its GL context current. There is no stdio or
+ * headless mode. */
 
-/* 0 = newline-delimited JSON (default) / 1 = Content-Length framed.
- * Returns the framing now in effect. */
-int mcp_set_framing(int lsp);
-
-/* Viewer-hosted MCP server (architecture B). The HTTP server runs on its own
+/* Viewer-hosted MCP server. The HTTP server runs on its own
  * thread; every request is queued and executed by mcp_viewer_poll() on the
  * viewer's main thread, which owns the only GL context. */
 typedef struct {

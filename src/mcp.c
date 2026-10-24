@@ -1,14 +1,12 @@
 /*
- * MCP (Model Context Protocol) server for the Shadertoy SDL2 viewer.
+ * MCP (Model Context Protocol) server for the Shadertoy viewer.
  *
- * Standalone headless server over stdio (`--mcp`): JSON-RPC 2.0, default
- * transport is one JSON object per line (MCP stdio). Incoming LSP-style
- * "Content-Length: N" framing is also accepted, and --mcp-lsp switches
- * replies to that style. No window is created unless a GL tool
- * (compile/screenshot/run) needs one; even then it stays hidden.
- *
- * For a live preview run the interactive viewer separately on the same
- * shaders/ directory — it hot-reloads files written by this server.
+ * Transport: HTTP only, served by the interactive viewer on
+ * 127.0.0.1:<port>/mcp (architecture B). The socket thread owns the network,
+ * but every request is executed by the viewer's main thread via
+ * mcp_viewer_poll(), so tools run with the window's GL context current.
+ * There is deliberately no stdio transport: a separate process would need
+ * its own hidden context and could not see or drive the live window.
  *
  * Uses libjq for JSON parsing and serialization.
  */
@@ -27,8 +25,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <fcntl.h>
-#include <io.h>
 #include <process.h>
 #define mcp_getpid _getpid
 typedef SOCKET mcp_socket_t;
@@ -53,17 +49,6 @@ typedef int mcp_socket_t;
 #include "mcp.h"
 #include "shader_common.h"
 #include "shader_list.h"
-
-/* Windows opens stdio in text mode, which turns every \n into \r\n and
- * corrupts Content-Length framing (CR would be doubled). MCP/LSP framing
- * is byte-exact, so both streams must be binary. */
-static void mcp_stdio_binary(void)
-{
-#ifdef _WIN32
-    _setmode(_fileno(stdin),  _O_BINARY);
-    _setmode(_fileno(stdout), _O_BINARY);
-#endif
-}
 
 #define MCP_PROTOCOLS_SUPPORTED "2024-11-05", "2025-03-26", "2025-06-18"
 #define MCP_SERVER_NAME      "shadertoy-sdl2"
@@ -94,105 +79,22 @@ static const char *mcp_shader_path(int i)
 }
 
 /* ------------------------------------------------------------------ */
-/* stdio framing                                                       */
+/* Response capture                                                    */
 /*                                                                    */
-/* One reader for both wire formats:                                  */
-/*   1. Newline-delimited JSON — what MCP clients send. Lines are     */
-/*      read with a growing buffer, so a large write_shader content   */
-/*      payload is never truncated mid-message.                        */
-/*   2. LSP-style Content-Length headers.                             */
-/* Returns a malloc'd NUL-terminated body, or NULL on EOF/error.      */
+/* The HTTP thread cannot touch the JSON-RPC dispatch (it may call GL),
+ * so mcp_viewer_poll() runs it on the main thread and reads the reply
+ * out of mcp_captured. Only the main thread touches this state; the
+ * HTTP thread just receives the owned string.                          */
 /* ------------------------------------------------------------------ */
 
-static char *mcp_read_line(size_t *out_len)
-{
-    size_t cap = 128, len = 0;
-    char *buf = malloc(cap + 2);
-    if (!buf) return NULL;
-    int c = fgetc(stdin);
-    if (c == EOF) { free(buf); return NULL; }
-    while (c != '\n' && c != EOF) {
-        if (len + 2 > cap) {
-            cap *= 2;
-            char *nb = realloc(buf, cap + 2);
-            if (!nb) { free(buf); return NULL; }
-            buf = nb;
-        }
-        buf[len++] = (char)c;
-        c = fgetc(stdin);
-    }
-    if (len && buf[len - 1] == '\r') len--; /* strip CRLF */
-    buf[len] = '\0';
-    if (out_len) *out_len = len;
-    return buf;
-}
-
-static char *mcp_read_message_body(void)
-{
-    for (;;) {
-        size_t len = 0;
-        char *line = mcp_read_line(&len);
-        if (!line) return NULL; /* EOF between messages */
-
-        if (len > 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
-            long clen = strtol(line + 15, NULL, 10);
-            free(line);
-            if (clen < 0 || clen > (long)(256 * 1024 * 1024))
-                return NULL;
-
-            /* Consume remaining header lines up to the blank line. */
-            for (;;) {
-                size_t hl;
-                char *h = mcp_read_line(&hl);
-                if (!h) return NULL; /* EOF inside header block */
-                int is_blank = (hl == 0);
-                if (hl > 15 && strncasecmp(h, "Content-Length:", 15) == 0)
-                    clen = strtol(h + 15, NULL, 10);
-                free(h);
-                if (is_blank) break;
-            }
-
-            char *body = malloc((size_t)clen + 1);
-            if (!body) return NULL;
-            size_t n = fread(body, 1, (size_t)clen, stdin);
-            body[n] = '\0';
-            return body;
-        }
-
-        if (len == 0) { free(line); continue; } /* blank separator */
-        return line; /* the whole JSON line, uncapped */
-    }
-}
-
-/* 0 = newline-delimited JSON (default, MCP stdio transport)
- * 1 = Content-Length framed (LSP-style clients) */
-static int mcp_framing = 0;
-
-/* Architecture B captures the reply instead of printing it. Only the main
- * thread touches these; the HTTP thread just receives the owned string. */
-static int mcp_capture_enabled = 0;
 static char *mcp_captured = NULL;
 
 static void mcp_write_message(const char *json)
 {
-    if (mcp_capture_enabled) {
-        free(mcp_captured);
-        mcp_captured = malloc(strlen(json) + 1);
-        if (mcp_captured)
-            strcpy(mcp_captured, json);
-        return;
-    }
-    if (mcp_framing)
-        printf("Content-Length: %d\r\n\r\n%s", (int)strlen(json), json);
-    else
-        printf("%s\n", json);
-    fflush(stdout);
-}
-
-int mcp_set_framing(int lsp)
-{
-    mcp_framing = lsp ? 1 : 0;
-    return mcp_framing;
+    free(mcp_captured);
+    mcp_captured = malloc(strlen(json) + 1);
+    if (mcp_captured)
+        strcpy(mcp_captured, json);
 }
 
 /* ------------------------------------------------------------------ */
@@ -514,95 +416,19 @@ static char *mcp_encode_png(int width, int height,
 }
 
 /* ------------------------------------------------------------------ */
-/* Hidden GL context for headless compile/render                       */
+/* GL context                                                          */
+/*                                                                    */
+/* The server only runs inside the viewer (architecture B), which owns
+ * the sole GL context and keeps it current on its main thread. There is
+ * no headless/hidden context: nothing else can call GL here, so the only
+ * correct answer is "yes, a context is current".                      */
 /* ------------------------------------------------------------------ */
 
 #include "glad.h"
 
-static SDL_Window   *mcp_gl_window  = NULL;
-static SDL_GLContext mcp_gl_context = NULL;
-static int            mcp_gl_ready   = 0;
-
 static int mcp_gl_init(void)
 {
-    /* Viewer-hosted: the caller already runs on the main thread with the
-     * viewer's context current. Never create a hidden window here. */
-    if (mcp_viewer_mode) return 1;
-    if (mcp_gl_ready) return 1;
-
-    if (SDL_WasInit(SDL_INIT_VIDEO) == 0) {
-        if (SDL_Init(SDL_INIT_VIDEO) < 0)
-            return 0;
-    }
-
-    /* Set attributes BEFORE the window is created — SDL ignores them
-     * afterwards. Probe desktop core 3.3 first, mirroring the viewer. */
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 0);
-#ifdef USE_GLES
-    static const struct { int profile, major, minor; } tries[] = {
-        { SDL_GL_CONTEXT_PROFILE_ES, 3, 2 },
-        { SDL_GL_CONTEXT_PROFILE_ES, 3, 1 },
-        { SDL_GL_CONTEXT_PROFILE_ES, 3, 0 },
-    };
-#else
-    static const struct { int profile, major, minor; } tries[] = {
-        { SDL_GL_CONTEXT_PROFILE_CORE,          3, 3 },
-        { SDL_GL_CONTEXT_PROFILE_COMPATIBILITY, 3, 3 },
-    };
-#endif
-
-    SDL_Window *window = NULL;
-    SDL_GLContext ctx = NULL;
-    for (size_t i = 0; i < sizeof tries / sizeof tries[0]; i++) {
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, tries[i].profile);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, tries[i].major);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, tries[i].minor);
-        window = SDL_CreateWindow("shadertoy-mcp",
-            0, 0, 1, 1, SDL_WINDOW_HIDDEN | SDL_WINDOW_OPENGL);
-        if (!window) continue;
-        ctx = SDL_GL_CreateContext(window);
-        if (ctx) break;
-        SDL_DestroyWindow(window);
-        window = NULL;
-    }
-    if (!ctx) {
-        SDL_Quit();
-        return 0;
-    }
-    mcp_gl_window = window;
-    mcp_gl_context = ctx;
-
-#ifdef USE_GLES
-    if (!gladLoadGLES2Loader((GLADloadproc)SDL_GL_GetProcAddress)) {
-#else
-    if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) {
-#endif
-        SDL_GL_DeleteContext(mcp_gl_context);
-        SDL_DestroyWindow(mcp_gl_window);
-        mcp_gl_window = NULL;
-        mcp_gl_context = NULL;
-        SDL_Quit();
-        return 0;
-    }
-
-    mcp_gl_ready = 1;
-    return 1;
-}
-
-static void mcp_gl_cleanup(void)
-{
-    if (mcp_viewer_mode)
-        return;
-    if (!mcp_gl_ready)
-        return;
-    if (mcp_gl_context)
-        SDL_GL_DeleteContext(mcp_gl_context);
-    if (mcp_gl_window)
-        SDL_DestroyWindow(mcp_gl_window);
-    mcp_gl_window = NULL;
-    mcp_gl_context = NULL;
-    mcp_gl_ready = 0;
-    SDL_Quit();
+    return mcp_viewer_mode;
 }
 
 /* ------------------------------------------------------------------ */
@@ -941,15 +767,9 @@ static jv tool_screenshot(jv params)
 {
     char err[4096 + 64];
 
-    /* Viewer mode can grab the backbuffer of the frame the main loop just
-     * drew. That includes mouse/keyboard/date state; the offscreen path
-     * cannot. Only available in the viewer-hosted server. */
+    /* Grab the backbuffer of the frame the main loop just drew. That
+     * includes mouse/keyboard/date state; the offscreen path cannot. */
     if (arg_bool(params, "window", 0)) {
-        if (!mcp_viewer_mode)
-            return mcp_tool_error(
-                "window capture requires the viewer-hosted MCP server "
-                "(start the viewer instead of --mcp).");
-
         GLint vp[4] = {0};
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glGetIntegerv(GL_VIEWPORT, vp);
@@ -1276,13 +1096,11 @@ static jv tool_reload_shaders(jv params)
                       SHADER_DIR, mcp_shaders.count);
 }
 
-/* Switch the visible shader. Only the viewer-hosted server can do this. */
+/* Switch the visible shader (via the viewer's hook). */
 static jv tool_load_shader(jv params)
 {
-    if (!mcp_viewer_mode || !g_mcp_hooks || !g_mcp_hooks->load_shader)
-        return mcp_tool_error(
-            "load_shader requires the viewer-hosted MCP server "
-            "(start the viewer instead of --mcp).");
+    if (!g_mcp_hooks || !g_mcp_hooks->load_shader)
+        return mcp_tool_error("load_shader is not available.");
 
     char name[280] = {0};
     jv name_jv = jv_object_get(jv_copy(params), jv_string("name"));
@@ -1338,10 +1156,8 @@ static jv tool_load_shader(jv params)
 static jv tool_get_viewer_status(jv params)
 {
     (void)params;
-    if (!mcp_viewer_mode || !g_mcp_hooks || !g_mcp_hooks->status)
-        return mcp_tool_error(
-            "get_viewer_status requires the viewer-hosted MCP server "
-            "(start the viewer instead of --mcp).");
+    if (!g_mcp_hooks || !g_mcp_hooks->status)
+        return mcp_tool_error("get_viewer_status is not available.");
 
     char buf[1024] = {0};
     g_mcp_hooks->status(buf, sizeof buf);
@@ -1400,7 +1216,7 @@ static jv handle_tools_list(jv params)
             "\"width\":{\"type\":\"integer\",\"minimum\":1,\"default\":640},"
             "\"height\":{\"type\":\"integer\",\"minimum\":1,\"default\":480},"
             "\"time\":{\"type\":\"number\",\"default\":0},"
-            "\"window\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Capture the actual viewer backbuffer (viewer-hosted server only)\"}},"
+            "\"window\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Capture the actual viewer backbuffer instead of an offscreen frame\"}},"
             "\"description\":\"Provide either name or index unless window is true\"}" },
         { "run_shaders",
           "Run a shader with advancing time, reporting FPS; optionally capture the last frame as PNG. Name or index.",
@@ -1430,13 +1246,13 @@ static jv handle_tools_list(jv params)
           "Rescan the shaders/ directory for new or changed files.",
           "{\"type\":\"object\",\"properties\":{}}" },
         { "load_shader",
-          "Switch the visible viewer to another shader (viewer-hosted server only). Name or index.",
+          "Switch the visible viewer to another shader. Name or index.",
           "{\"type\":\"object\",\"properties\":{"
             "\"name\":{\"type\":\"string\"},"
             "\"index\":{\"type\":\"integer\",\"minimum\":0}},"
             "\"description\":\"Provide either name or index\"}" },
         { "get_viewer_status",
-          "Report viewer state: running, current shader, FPS, and window size (viewer-hosted server only).",
+          "Report viewer state: running, current shader, FPS, and window size.",
           "{\"type\":\"object\",\"properties\":{}}" },
     };
 
@@ -2020,11 +1836,9 @@ void mcp_viewer_poll(void)
         char *body = mcp_job_body;
         mcp_job_body = NULL;
 
-        mcp_capture_enabled = 1;
         free(mcp_captured);
         mcp_captured = NULL;
         mcp_process_request(body);
-        mcp_capture_enabled = 0;
 
         free(body);
         mcp_job_response = mcp_captured;
@@ -2090,32 +1904,3 @@ int mcp_viewer_port(void)
     return mcp_http_port;
 }
 
-/* ------------------------------------------------------------------ */
-/* Server main loop                                                   */
-/* ------------------------------------------------------------------ */
-
-int mcp_run(void)
-{
-    mcp_stdio_binary();
-    while (!feof(stdin)) {
-        char *body = mcp_read_message_body();
-        if (!body)
-            break;
-
-        /* Skip whitespace-only bodies (stray blank lines). */
-        int blank = 1;
-        for (const char *p = body; *p; p++)
-            if (!isspace((unsigned char)*p)) { blank = 0; break; }
-        if (blank) {
-            free(body);
-            continue;
-        }
-
-        mcp_process_request(body);
-        free(body);
-    }
-
-    mcp_gl_cleanup();
-    shader_list_free(&mcp_shaders);
-    return 0;
-}
