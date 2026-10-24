@@ -169,11 +169,23 @@ build/shadertoy.exe shaders/some_shader.glsl -k 0    # keyboard on iChannel0
 - Layout is 256x3 `GL_R8`, indexed by Shadertoy/JS key code:
   row 0 = currently held, row 1 = pressed this frame, row 2 = toggled.
 - Read it with `texelFetch(iChannel0, ivec2(keyCode, 0), 0).x`.
+- Codes follow the **JavaScript `keyCode`** values, not ASCII. Letters are
+  uppercase regardless of Shift (`W` and `w` are both `87`, `A` is `65`), so
+  `ivec2(87, 0)` works whether or not Shift is held. Digits are `48`..`57`,
+  keypad digits `96`..`105`, F-keys `112`..`123`. Punctuation uses the JS
+  numbers, which differ from ASCII: `;` is `186`, `=` is `187`, `-` is `189`.
+  Both backends produce identical indices (verified by rendering the same
+  key on each).
+- Auto-repeat is ignored: holding a key does **not** re-fire row 1 or flip
+  row 2. Toggled state changes exactly once per physical press.
 - `iChannelResolution[ch]` is reported as `vec3(256.0, 3.0, 1.0)`.
 - `-k 0` and `-0 <file>` target the same channel and are rejected at
-  startup (`cannot bind texture and keyboard to the same channel`).
+  startup (`cannot bind texture and keyboard to the same channel`). An
+  out-of-range or non-numeric value (`-k 7`, `-k abc`) silently leaves the
+  keyboard unbound; `-k abc` parses as 0 and binds `iChannel0`.
 - Row 0 clears on key release and row 1 is cleared after every frame, so
-  "pressed this frame" is exactly one frame wide; row 2 persists.
+  "pressed this frame" is exactly one frame wide; row 2 persists. A key
+  pressed *and* released between two polls is never seen as pressed.
 - Keyboard channels exist only in the viewer. Offscreen MCP renders have no
   keyboard, so the channel falls back to black there.
 
@@ -487,6 +499,53 @@ rather than a JSON-RPC protocol error. Non-object messages (including
 JSON-RPC batches) get `-32600` and malformed JSON gets `-32700`; neither
 kills the server.
 
+## Codebase memory (symbol graph)
+
+The repository is indexed into a codebase-memory graph — symbols, calls,
+includes — so an agent can navigate with graph queries instead of
+re-reading files. Nothing in the build or the viewer depends on it; it is
+an inspection aid that lives beside the source.
+
+**Index once per checkout** (`index_repository`):
+
+| Field | Value |
+|-------|-------|
+| `repo_path` | `C:/Projects/shadertoy` |
+| `mode` | `full` (everything + semantics) |
+| project id | `C-Projects-shadertoy` |
+
+`repo_path` must be the Windows form. The MSYS form `/c/Projects/shadertoy`
+works in the shell but fails with `Pipeline failed`; `mode: "fast"` fails the
+same way. A CLI session has no file watcher (`index_status` reports
+`watch: watched: false`), so re-run the index after a large refactor rather
+than expecting it to follow edits.
+
+**Querying** — every tool takes `project: "C-Projects-shadertoy"`:
+
+| Tool | Use it for |
+|------|------------|
+| `search_graph` | find symbols by regex name / BM25 / semantic query |
+| `get_code_snippet` | read one symbol by qualified name |
+| `get_file_outline` | declaration outline of one exact file |
+| `trace_path` | callers or callees, depth-limited, tests excluded by default |
+| `query_graph` | multi-hop and aggregate Cypher (`CALLS`, `INHERITS`, …) |
+| `get_architecture` | packages, entry points, hotspots, layers, cycles |
+| `detect_changes` | map a `git diff` to symbols and their blast radius |
+| `index_status` / `check_index_coverage` | freshness and coverage gaps |
+
+**What is not in the graph.** Excluded by design: `.git/`, `build/`,
+`tools/`, `*.o` and `*.exe`. `glad/glad.h`, `glad_es/glad.h` and the
+`Makefile` only parse partially, so their symbols can be missing or stale.
+When the graph disagrees with the source — and for anything under `tools/`,
+notably `tools/shadertoy-mcp-bridge.py` — fall back to `rg`. Use `rg` for all
+content searches, never `grep`: the `grep` on PATH on this machine is BusyBox
+and rejects common flags (`--null`, `-P`, …).
+
+The index is kept in the codebase-memory store outside the repo. Passing
+`persistence: true` writes `.codebase-memory/` as well; that directory is
+gitignored (like `.codegraph/`, the older CLI indexer's database) and is
+never committed.
+
 ## Project structure
 
 ```
@@ -511,6 +570,7 @@ glad_es/    — GLAD OpenGL ES loader (ARM / aarch64)
 stb_image.h — texture loading (single-header)
 shaders/    — GLSL fragment shaders (.glsl) + optional <name>.<ch>.png textures
 Makefile    — GNU Make build
+.codegraph/ — legacy CLI symbol-index DB (gitignored; not part of the build)
 ```
 
 ### What a Shadertoy shader is (per this project)

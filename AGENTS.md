@@ -1,10 +1,21 @@
 # Agent notes
 
-- Use `rg.exe` for content searches. The `grep` on PATH is BusyBox and
-  rejects common flags (`--null`, `-P`, etc.).
-- Windows tools need single-slash flags in this shell: `taskkill /F /IM
-  shadertoy-console.exe`, not the MSYS-style `//F` (passed through literally
-  and rejected).
+- Always use `rg` for content searches, never `grep`. The `grep` on PATH is
+  BusyBox and rejects common flags (`--null`, `-P`, etc.). The same applies to
+  commands you put in docs, scripts and CI: `rg` only.
+- This repo is indexed in codebase-memory as project `C-Projects-shadertoy`.
+  Index with `repo_path: "C:/Projects/shadertoy"` — the MSYS form
+  `/c/Projects/shadertoy` fails with `Pipeline failed` at any mode. `tools/`
+  is excluded from the index, so read the bridge and the flagged `glad*`
+  headers with `rg`. See the README section "Codebase memory".
+- Windows tools need single-slash flags, but MSYS rewrites them into paths,
+  so prefix with `MSYS2_ARG_CONV_EXCL='*'`:
+  `MSYS2_ARG_CONV_EXCL='*' taskkill /F /IM shadertoy-console.exe`. Without it
+  taskkill gets `F:/` and fails with `Invalid argument/option - 'F:/'`.
+  (Older notes claimed plain `/F` worked; it does not under this shell.) A
+  failed kill leaves the old viewer holding the MCP port, so screenshots and
+  tool calls silently hit the stale process — check `tasklist | rg shadertoy`
+  when results look impossible.
 - Two viewer backends share everything except the window layer:
   `src/main-sdl2.c` (default) and `src/main-glfw.c` (GLFW + GLAD). Any change
   to one `main-*.c` must be mirrored in the other; `config.h` holds the CLI
