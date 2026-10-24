@@ -35,11 +35,15 @@ make DEBUG=1        # -O0 -g, no strip -> *-debug binaries
 make SAN=1          # opt-in AddressSanitizer (unsupported under MSVCRT-based toolchains)
 ```
 
-`BACKEND=sdl2` is the default. Both backends share `shader_common.c`,
-`shader_list.c`, `mcp.c`, and the CLI table in `config.h`; only the
-window/input layer differs (`main-sdl2.c` vs `main-glfw.c`). The GLFW build
-still links SDL2 because `mcp.c` uses SDL for its HTTP thread and sync
-primitives.
+`BACKEND=sdl2` is the default. Both backends share `viewer_core.c`,
+`shader_common.c`, `shader_list.c`, `mcp.c`, and the CLI table in
+`config.h`; only the window/input layer differs (`main-sdl2.c` vs
+`main-glfw.c`). The split is enforced by structure, not by `#ifdef`: the core
+is compiled by both backends with no backend conditionals in it, and each
+window layer hands it a small `vc_backend_services` vtable (set the title,
+report the window size) so the core never needs to know which toolkit is
+underneath. The GLFW build still links SDL2 because `mcp.c` uses SDL for its
+HTTP thread and sync primitives.
 
 Two binaries appear in `build/` per backend:
 
@@ -550,9 +554,14 @@ never committed.
 
 ```
 src/
-  main-sdl2.c     — SDL2 viewer (window, input, hot reload); hosts the
-                    MCP viewer hooks and starts the HTTP server
-  main-glfw.c     — GLFW backend, behavioural twin of main-sdl2.c
+  main-sdl2.c     — SDL2 window/input layer (default backend): window + GL
+                    context, event pump, SDL scancode → JS keyCode table
+  main-glfw.c     — GLFW window/input layer, behavioural twin of main-sdl2.c
+  viewer_core.c   — backend-independent viewer core: shader list + current
+                    shader state, hot reload, shader switching, channel
+                    textures, MCP viewer hooks, keyboard state buffer
+                    (single source of truth for both backends)
+  viewer_core.h   — its API, incl. the vc_backend_services vtable
   mcp.c           — MCP server: JSON-RPC/tools, HTTP transport, PNG encoder
   mcp.h           — viewer hooks + HTTP lifecycle
   shader_common.c — shared GLSL header/footer, program builder, uniforms,

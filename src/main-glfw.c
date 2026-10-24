@@ -26,281 +26,55 @@
 #include <time.h>
 #include "config.h"
 #include "mcp.h"
-#ifdef MCP_UNAVAILABLE
-/* Built without libjq (Makefile sets this define): keep the viewer building
- * with MCP disabled instead of failing at link time. */
-int mcp_viewer_start(int port, const mcp_viewer_hooks *hooks)
-{
-    (void)hooks;
-    if (port > 0)
-        fprintf(stderr, "MCP disabled: this build has no libjq "
-                        "(e.g. MSYS2: pacman -S mingw-w64-x86_64-jq).\n");
-    return 1;
-}
-void mcp_viewer_poll(void) {}
-void mcp_viewer_stop(void) {}
-int mcp_viewer_port(void) { return 0; }
-#endif
 #include "shader_common.h"
 #include "shader_list.h"
+#include "viewer_core.h"
 
 /* ==================================================================
- * Shader list (for no-arg browsing)
- * ================================================================== */
-
-/* Shader paths, grown dynamically. */
-static shader_list g_shaders;
-#define shader_paths (g_shaders.items)
-#define shader_count (g_shaders.count)
-static int   shader_index = 0;
-static unsigned long long current_source_hash;
-static int    current_source_hash_valid = 0;
-static int    reload_channels_pending = 0;
-
-/* Current shader state (for hot-reload on switch) */
-static GLuint  current_prog = 0;
-static shader_uniforms current_u;
-
-/* Uniform locations for the program currently being drawn. A shader switch
- * copies current_u into g_u, so the draw loop always reads one struct. */
-static shader_uniforms g_u;
+ * Backend state
+ * ==================================================================
+ *
+ * Shader list, current-shader state, channel textures, keystate bookkeeping
+ * and the MCP viewer hooks live in viewer_core.c, shared with main-sdl2.c.
+ * What is left here is the window/input layer.
+ */
 
 static GLFWwindow *g_window = NULL;
 static char  g_title_buf[512];
-static float g_display_fps = 0.0f;
 
 /* Window/framebuffer size, kept current by the resize callback. */
 static float g_width = 640.0f, g_height = 480.0f;
 
-/* Explicit CLI channel textures (`--texture0..3`); auto-detected textures
- * live in shader_common and are never stored here. */
-static const char *g_tex_cli[4] = { NULL, NULL, NULL, NULL };
-static float   g_chanRes[4][3] = {{0}};
-static GLuint  g_textures[4] = {0, 0, 0, 0};
-static int     g_bindKeyboard = -1;
-
 #define shader_basename shader_list_basename
-
-/* (Re)load the channel textures for the current shader: CLI-explicit files
- * win, otherwise auto-detect "<shader>.<ch>.<ext>" via shader_common. */
-static void load_channel_textures(void)
-{
-    shader_free_channels(g_textures);
-    shader_load_channels(shader_paths[shader_index], g_tex_cli,
-                         g_textures, g_chanRes);
-
-    if (g_bindKeyboard >= 0) {
-        g_chanRes[g_bindKeyboard][0] = 256.0f;
-        g_chanRes[g_bindKeyboard][1] = 3.0f;
-        g_chanRes[g_bindKeyboard][2] = 1.0f;
-    }
-}
 
 static void update_window_title(float fps)
 {
-    const char *name = shader_basename(shader_paths[shader_index]);
-    if (shader_count > 1)
+    int count = vc_shader_count();
+    const char *name = shader_basename(vc_shader_path(vc_shader_index()));
+    if (count > 1)
         snprintf(g_title_buf, sizeof g_title_buf, "[%d/%d] %s  %.1f FPS",
-                 shader_index + 1, shader_count, name, fps);
+                 vc_shader_index() + 1, count, name, fps);
     else
-        snprintf(g_title_buf, sizeof g_title_buf, "%s  %.1f FPS",
-                 name, fps);
+        snprintf(g_title_buf, sizeof g_title_buf, "%s  %.1f FPS", name, fps);
     if (g_window)
         glfwSetWindowTitle(g_window, g_title_buf);
 }
 
-/* Viewer-side compilation: the shared builder, with diagnostics on stderr. */
-static GLuint create_program(const char *frag_src, shader_uniforms *out_u)
+/* Backend service: report window size for the MCP status line. */
+static void get_window_size(int *w, int *h)
 {
-    char log[4096] = {0};
-    GLuint p = shader_build_program(frag_src, log, sizeof log);
-    if (!p) {
-        fprintf(stderr, "fragment shader compile error:\n%s\n",
-                log[0] ? log : "(no log available)");
-        return 0;
-    }
-    if (out_u)
-        shader_uniforms_lookup(p, out_u);
-    return p;
-}
-
-/* FNV-1a over the source bytes. Content beats mtime here: Windows stat has
- * one-second resolution, so back-to-back agent writes were invisible. */
-static unsigned long long hash_source(const char *src)
-{
-    unsigned long long h = 1469598103934665603ULL;
-    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
-        h ^= *p;
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-static GLuint load_shader_index(int idx, shader_uniforms *out_u,
-                                unsigned long long *out_hash)
-{
-    char *src = shader_read_file(shader_paths[idx]);
-    if (!src) {
-        fprintf(stderr, "Error: could not read %s\n", shader_paths[idx]);
-        return 0;
-    }
-    fprintf(stderr, "Loading shader [%d/%d]: %s\n", idx + 1, shader_count, shader_paths[idx]);
-    if (out_hash)
-        *out_hash = hash_source(src);
-    GLuint p = create_program(src, out_u);
-    free(src);
-    return p;
-}
-
-static void switch_shader(int delta)
-{
-    if (shader_count <= 1) return;
-    /* Advance until a shader actually compiles, trying each entry at most
-     * once so a run of broken files can't loop forever. On total failure
-     * the previously loaded shader keeps running. */
-    int original_index = shader_index;
-    for (int attempt = 0; attempt < shader_count; attempt++) {
-        int new_idx = (shader_index + delta + shader_count) % shader_count;
-        if (new_idx == shader_index) return;
-        unsigned long long new_hash = 0;
-        GLuint new_prog = load_shader_index(new_idx, &current_u, &new_hash);
-        if (!new_prog) {
-            fprintf(stderr, "Skipping '%s' (compilation failed).\n", shader_paths[new_idx]);
-            shader_index = new_idx;
-            continue;
-        }
-        if (current_prog)
-            glDeleteProgram(current_prog);
-        shader_index = new_idx;
-        current_prog = new_prog;
-        current_source_hash = new_hash;
-        current_source_hash_valid = 1;
-        /* Auto-detect and reload textures for new shader */
-        load_channel_textures();
-        return;
-    }
-    shader_index = original_index;
-    fprintf(stderr, "No other shader compiled; keeping current one.\n");
-}
-
-/* ==================================================================
- * MCP viewer hooks (architecture B)
- * ================================================================== */
-
-/* Rescan shaders/ and keep the current shader selected by filename, so
- * files created by MCP tools appear without restarting the viewer. */
-static void rescan_shaders_preserving_current(void)
-{
-    shader_list fresh;
-    shader_list_init(&fresh);
-    if (shader_list_scan(&fresh, "shaders") <= 0) {
-        shader_list_free(&fresh);
-        return;
-    }
-    char current_name[512];
-    snprintf(current_name, sizeof current_name, "%s",
-             shader_basename(shader_paths[shader_index]));
-    shader_list_free(&g_shaders);
-    g_shaders = fresh;
-    int found = 0;
-    for (int i = 0; i < shader_count; i++) {
-        if (strcmp(shader_basename(shader_paths[i]), current_name) == 0) {
-            shader_index = i;
-            found = 1;
-            break;
-        }
-    }
-    if (!found) {
-        shader_index = 0;
-        current_source_hash_valid = 0;
-        reload_channels_pending = 1;
-    }
-}
-
-static int find_shader_by_name(const char *name)
-{
-    for (int i = 0; i < shader_count; i++) {
-        const char *path = shader_paths[i];
-        const char *base = shader_basename(path);
-        if (strcmp(path, name) == 0 || strcmp(base, name) == 0)
-            return i;
-        size_t blen = strlen(base), nlen = strlen(name);
-        if (blen > 5 && strcmp(base + blen - 5, ".glsl") == 0 &&
-            nlen == blen - 5 && strncmp(base, name, nlen) == 0)
-            return i;
-    }
-    return -1;
-}
-
-/* Main thread, GL context current: called from mcp_viewer_poll(). */
-static int viewer_hook_load_shader(const char *name, int index,
-                                   char *err, size_t errlen)
-{
-    int idx = index;
-    if (name && *name) {
-        idx = find_shader_by_name(name);
-        if (idx < 0) {
-            /* May have just been written by write_shader. */
-            rescan_shaders_preserving_current();
-            idx = find_shader_by_name(name);
-        }
-        if (idx < 0) {
-            snprintf(err, errlen, "Unknown shader: %s", name);
-            return 0;
-        }
-    }
-    if (idx < 0 || idx >= shader_count) {
-        rescan_shaders_preserving_current();
-        if (idx < 0 || idx >= shader_count) {
-            snprintf(err, errlen, "Shader index out of range (0..%d)",
-                     shader_count - 1);
-            return 0;
-        }
-    }
-    if (idx == shader_index)
-        return 1;
-
-    shader_uniforms u;
-    unsigned long long h = 0;
-    GLuint p = load_shader_index(idx, &u, &h);
-    if (!p) {
-        snprintf(err, errlen, "Shader failed to compile: %s",
-                 shader_basename(shader_paths[idx]));
-        return 0;
-    }
-    if (current_prog)
-        glDeleteProgram(current_prog);
-    shader_index = idx;
-    current_prog = p;
-    current_u = u;
-    g_u = u;
-    current_source_hash = h;
-    current_source_hash_valid = 1;
-    load_channel_textures();
-    update_window_title(g_display_fps);
-    return 1;
-}
-
-static void viewer_hook_status(char *buf, size_t len)
-{
-    int w = 0, h = 0;
+    *w = 0;
+    *h = 0;
     if (g_window)
-        glfwGetWindowSize(g_window, &w, &h);
-    snprintf(buf, len,
-             "running: yes\n"
-             "shader: %s\n"
-             "index: %d/%d\n"
-             "window: %dx%d\n"
-             "fps: %.1f",
-             shader_basename(shader_paths[shader_index]),
-             shader_index + 1, shader_count, w, h, g_display_fps);
+        glfwGetWindowSize(g_window, w, h);
 }
 
-static const mcp_viewer_hooks g_mcp_viewer_hooks = {
-    viewer_hook_load_shader,
-    viewer_hook_status
+static const vc_backend_services g_services = {
+    update_window_title,
+    get_window_size
 };
 
+/* Viewer-side compilation: the shared builder, with diagnostics on stderr. */
 /* ==================================================================
  * Window callbacks
  * ================================================================== */
@@ -333,9 +107,6 @@ static void mouse_cb(GLFWwindow *w, int button, int action, int mods)
 /* ==================================================================
  * Keyboard state texture (Shadertoy-compatible)
  * ================================================================== */
-
-static unsigned char keyStateData[256 * 3];
-static GLuint keyStateTexID = 0;
 
 /* Map GLFW key codes → Shadertoy / JS key codes.
  *
@@ -405,56 +176,25 @@ static void populate_key_lookup(void)
     keyLookup[GLFW_KEY_MENU]          = 93;
 }
 
-static void reset_keystate(void)
-{
-    memset(keyStateData, 0, sizeof(keyStateData));
-}
-
-static void partially_reset_keystate(void)
-{
-    /* Reset 'just pressed' (rising edge) flags */
-    for (int i = 0; i < 256; i++)
-        keyStateData[i + 256] = 0;
-}
-
 static void key_callback(GLFWwindow *w, int key, int scancode, int action, int mods)
 {
     (void)scancode; (void)mods;
     if (action == GLFW_PRESS) {
         int js = (key >= 0 && key <= GLFW_KEY_LAST) ? keyLookup[key] : -1;
-        if (js >= 0) {
-            keyStateData[js + 0]   = 255;  /* held */
-            keyStateData[js + 256] = 255;  /* just pressed */
-            keyStateData[js + 512] ^= 0xff; /* toggled */
-        }
+        if (js >= 0)
+            vc_keystate_press(js);
         if (key == GLFW_KEY_Q || key == GLFW_KEY_ESCAPE)
             glfwSetWindowShouldClose(w, 1);
         /* Shader navigation (switch_shader skips shaders that fail to compile) */
         if (key == GLFW_KEY_SPACE || key == GLFW_KEY_RIGHT || key == GLFW_KEY_PAGE_DOWN)
-            switch_shader(1);
+            vc_switch_shader(1);
         if (key == GLFW_KEY_BACKSPACE || key == GLFW_KEY_LEFT || key == GLFW_KEY_PAGE_UP)
-            switch_shader(-1);
+            vc_switch_shader(-1);
     } else if (action == GLFW_RELEASE) {
         int js = (key >= 0 && key <= GLFW_KEY_LAST) ? keyLookup[key] : -1;
-        if (js >= 0) {
-            keyStateData[js + 0]   = 0;
-            keyStateData[js + 256] = 0;
-        }
+        if (js >= 0)
+            vc_keystate_release(js);
     }
-}
-
-static void update_keystate_texture(void)
-{
-    if (g_bindKeyboard < 0)
-        return;
-    if (!keyStateTexID)
-        glGenTextures(1, &keyStateTexID); /* lazy init: needs live GL context */
-    glActiveTexture(GL_TEXTURE0 + g_bindKeyboard);
-    glBindTexture(GL_TEXTURE_2D, keyStateTexID);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 256, 3, 0,
-                 GL_RED, GL_UNSIGNED_BYTE, keyStateData);
 }
 
 /* ==================================================================
@@ -480,7 +220,7 @@ int main(int argc, char **argv)
         switch (opt) {
         case 's': shader_path = optarg; break;
         case '0': case '1': case '2': case '3':
-            g_tex_cli[opt - '0'] = optarg; break;
+            vc_tex_cli[opt - '0'] = optarg; break;
         case 'f': fullscreen = 1; break;
         case 'w': { int v = atoi(optarg); if (v > 0) window_width = v; break; }
         case 'h': { int v = atoi(optarg); if (v > 0) window_height = v; break; }
@@ -529,7 +269,7 @@ int main(int argc, char **argv)
     if (optind < argc)
         shader_path = argv[optind];
 
-    if (bindKeyboard >= 0 && g_tex_cli[bindKeyboard]) {
+    if (bindKeyboard >= 0 && vc_tex_cli[bindKeyboard]) {
         fprintf(stderr, "Error: cannot bind texture and keyboard to the same channel.\n");
         return 1;
     }
@@ -620,7 +360,12 @@ int main(int argc, char **argv)
     glfwSetMouseButtonCallback(g_window, mouse_cb);
     glfwSetKeyCallback(g_window, key_callback);
     populate_key_lookup();
-    reset_keystate();
+    /* The core cannot set a window title or ask the window for its size, so
+     * it calls back into this file for both. Register before any shader
+     * loads, since loading a shader refreshes the title. */
+    vc_set_backend_services(&g_services);
+
+    vc_reset_keystate();
 
     /* Load GL functions via GLAD */
 #ifdef USE_GLES
@@ -651,15 +396,15 @@ int main(int argc, char **argv)
     }
 
     /* Shader list */
-    shader_list_init(&g_shaders);
+    shader_list_init(vc_shaders());
     if (shader_path) {
-        if (shader_list_add(&g_shaders, shader_path) != 0) {
+        if (shader_list_add(vc_shaders(), shader_path) != 0) {
             fprintf(stderr, "Error: out of memory adding shader path.\n");
             glfwDestroyWindow(g_window);
             glfwTerminate();
             return 1;
         }
-        shader_index = 0;
+        vc_set_shader_index(0);
         /* Be explicit: without the directory scan there is nothing to browse,
          * so the cycle keys do nothing. Say so rather than failing silently. */
         fprintf(stderr,
@@ -667,38 +412,38 @@ int main(int argc, char **argv)
                 "disabled.\n"
                 "      Run without -s to browse everything in shaders/.\n");
     } else {
-        shader_list_scan(&g_shaders, "shaders");
-        if (shader_count == 0) {
+        shader_list_scan(vc_shaders(), "shaders");
+        if (vc_shader_count() == 0) {
             fprintf(stderr, "Error: no .glsl files found in shaders/ and no -s flag.\n");
-            shader_list_free(&g_shaders);
+            shader_list_free(vc_shaders());
             glfwDestroyWindow(g_window);
             glfwTerminate();
             return 1;
         }
-        printf("Found %d shader(s) in shaders/\n", shader_count);
+        printf("Found %d shader(s) in shaders/\n", vc_shader_count());
 
         /* Try shaders in order and start on the first one that compiles,
          * so one broken file doesn't kill the whole browser session. */
         int found = 0;
-        for (int i = 0; i < shader_count; i++) {
-            char *src = shader_read_file(shader_paths[i]);
+        for (int i = 0; i < vc_shader_count(); i++) {
+            char *src = shader_read_file(vc_shader_path(i));
             if (!src) {
-                fprintf(stderr, "Could not read '%s', skipping.\n", shader_paths[i]);
+                fprintf(stderr, "Could not read '%s', skipping.\n", vc_shader_path(i));
                 continue;
             }
-            GLuint test_prog = create_program(src, NULL);
+            GLuint test_prog = vc_create_program(src, NULL);
             free(src);
             if (test_prog) {
                 glDeleteProgram(test_prog);
-                shader_index = i;
+                vc_set_shader_index(i);
                 found = 1;
                 break;
             }
         }
         if (!found) {
             fprintf(stderr, "Error: none of the %d shaders in shaders/ compiled.\n",
-                    shader_count);
-            shader_list_free(&g_shaders);
+                    vc_shader_count());
+            shader_list_free(vc_shaders());
             glfwDestroyWindow(g_window);
             glfwTerminate();
             return 1;
@@ -706,34 +451,37 @@ int main(int argc, char **argv)
     }
 
     /* Load initial shader */
-    GLuint prog = load_shader_index(shader_index, &current_u,
-                                    &current_source_hash);
-    current_prog = prog;
-    current_source_hash_valid = 1;
+    shader_uniforms init_u;
+    unsigned long long init_hash = 0;
+    GLuint prog = vc_load_shader_index(vc_shader_index(), &init_u, &init_hash);
+    vc_set_current_program(prog);
+    vc_set_current_uniforms(init_u);
+    vc_set_source_hash(init_hash);
+    vc_set_source_hash_valid(1);
     if (!prog) {
         fprintf(stderr, "Error: shader compilation failed.\n");
-        shader_list_free(&g_shaders);
+        shader_list_free(vc_shaders());
         glfwDestroyWindow(g_window);
         glfwTerminate();
         return 1;
     }
 
-    g_u = current_u;
+    vc_set_draw_uniforms(vc_current_uniforms());
 
-    g_bindKeyboard = bindKeyboard;
+    vc_set_bind_keyboard(bindKeyboard);
 
-    load_channel_textures();
+    vc_load_channel_textures();
 
     /* Architecture B: the viewer hosts the MCP server. A port conflict is
      * fatal so the configured client URL never talks to the wrong instance. */
-    if (!mcp_viewer_start(mcp_port, &g_mcp_viewer_hooks)) {
+    if (!mcp_viewer_start(mcp_port, vc_mcp_hooks())) {
         fprintf(stderr,
                 "Could not start the MCP server on 127.0.0.1:%d.\n"
                 "Is another viewer already running?\n"
                 "See build/shadertoy-mcp.log.\n", mcp_port);
-        shader_free_channels(g_textures);
+        shader_free_channels(vc_channel_textures());
         glDeleteProgram(prog);
-        shader_list_free(&g_shaders);
+        shader_list_free(vc_shaders());
         glfwDestroyWindow(g_window);
         glfwTerminate();
         return 1;
@@ -779,7 +527,7 @@ int main(int argc, char **argv)
             static double last_scan = 0.0;
             if (!shader_path && t - last_scan >= 1.0) {
                 last_scan = t;
-                rescan_shaders_preserving_current();
+                vc_rescan_shaders_preserving_current();
             }
         }
 
@@ -789,24 +537,26 @@ int main(int argc, char **argv)
             static double last_poll = 0.0;
             if (t - last_poll >= 0.25) {
                 last_poll = t;
-                char *src = shader_read_file(shader_paths[shader_index]);
+                char *src = shader_read_file(vc_shader_path(vc_shader_index()));
                 if (src) {
-                    unsigned long long h = hash_source(src);
-                    if (!current_source_hash_valid ||
-                        h != current_source_hash) {
-                        current_source_hash = h;
-                        current_source_hash_valid = 1;
-                        GLuint reloaded = create_program(src, &current_u);
+                    unsigned long long h = vc_hash_source(src);
+                    if (!vc_source_hash_valid() ||
+                        h != vc_source_hash()) {
+                        vc_set_source_hash(h);
+                        vc_set_source_hash_valid(1);
+                        shader_uniforms new_u = vc_current_uniforms();
+                        GLuint reloaded = vc_create_program(src, &new_u);
                         if (reloaded) {
-                            if (current_prog && current_prog != reloaded)
-                                glDeleteProgram(current_prog);
-                            current_prog = reloaded;
-                            if (reload_channels_pending) {
-                                load_channel_textures();
-                                reload_channels_pending = 0;
+                            if (vc_current_program() && vc_current_program() != reloaded)
+                                glDeleteProgram(vc_current_program());
+                            vc_set_current_program(reloaded);
+                            vc_set_current_uniforms(new_u);
+                            if (vc_reload_channels_pending()) {
+                                vc_load_channel_textures();
+                                vc_set_reload_channels_pending(0);
                             }
                             fprintf(stderr, "Reloaded shader: %s\n",
-                                    shader_paths[shader_index]);
+                                    vc_shader_path(vc_shader_index()));
                         }
                     }
                     free(src);
@@ -820,7 +570,7 @@ int main(int argc, char **argv)
         float dt = t - fps_timer;
         if (dt >= 0.5f) {
             current_fps = (float)frame_count / dt;
-            g_display_fps = current_fps;
+            vc_set_display_fps(current_fps);
             frame_count = 0;
             fps_timer = t;
             update_window_title(current_fps);
@@ -833,9 +583,9 @@ int main(int argc, char **argv)
         struct tm *tm_now = localtime(&now);
 
         /* Hot-reload uniforms after shader switch */
-        if (current_prog != prog) {
-            prog = current_prog;
-            g_u = current_u;
+        if (vc_current_program() != prog) {
+            prog = vc_current_program();
+            vc_set_draw_uniforms(vc_current_uniforms());
         }
 
         /* Offscreen MCP tools leave their own framebuffer bound. */
@@ -859,7 +609,7 @@ int main(int argc, char **argv)
         f.mouse_y     = g_mouseY;
         f.mouse_left  = g_mouseL;
         f.mouse_right = g_mouseR;
-        memcpy(f.channel_resolution, g_chanRes, sizeof f.channel_resolution);
+        memcpy(f.channel_resolution, (*vc_channel_resolution()), sizeof f.channel_resolution);
         for (int ch = 0; ch < 4; ch++)
             f.channel_time[ch] = t;
         if (tm_now) {
@@ -872,16 +622,14 @@ int main(int argc, char **argv)
                              (float)tm_now->tm_sec +
                              (t - floor(t));
         }
-        shader_upload_uniforms(&g_u, &f);
+        shader_uniforms draw_u = vc_draw_uniforms();
+        shader_upload_uniforms(&draw_u, &f);
 
         /* Bind textures to iChannel0..3, then override the keyboard channel
          * if one is bound. Black fallbacks come from shader_common. */
-        shader_bind_channels(g_textures);
-        update_keystate_texture();
-        if (g_bindKeyboard >= 0 && keyStateTexID && g_bindKeyboard < 4) {
-            glActiveTexture(GL_TEXTURE0 + g_bindKeyboard);
-            glBindTexture(GL_TEXTURE_2D, keyStateTexID);
-        }
+        shader_bind_channels(vc_channel_textures());
+        vc_update_keystate_texture();
+        vc_bind_keystate_texture();
 
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -890,7 +638,7 @@ int main(int argc, char **argv)
         mcp_viewer_poll();
 
         glfwSwapBuffers(g_window);
-        partially_reset_keystate();
+        vc_partially_reset_keystate();
     }
 
     mcp_viewer_stop();
@@ -898,12 +646,11 @@ int main(int argc, char **argv)
     /* Cleanup */
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
-    shader_free_channels(g_textures);
-    if (keyStateTexID)
-        glDeleteTextures(1, &keyStateTexID);
+    shader_free_channels(vc_channel_textures());
+    vc_free_gl();
     glDeleteProgram(prog);
 
-    shader_list_free(&g_shaders);
+    shader_list_free(vc_shaders());
 
     glfwDestroyWindow(g_window);
     glfwTerminate();
