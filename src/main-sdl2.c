@@ -313,25 +313,36 @@ static void partially_reset_keystate(void)
         keyStateData[i + 256] = 0;
 }
 
-/* Map SDL scancodes → Shadertoy / JS key codes */
+/* Map SDL scancodes → Shadertoy / JS key codes.
+ *
+ * Letters are UPPERCASE ASCII (65..90): JavaScript reports e.keyCode for a
+ * letter as its uppercase code whatever the Shift state, so 'w' and 'W' are
+ * both 87. Shadertoy shaders key off those numbers.
+ *
+ * Punctuation uses the JS keyCode table (minus 189, equal 187, semicolon
+ * 186, ...), not ASCII — ';' is 186 in JS, not 59. Keep this table in step
+ * with populate_key_lookup() in main-glfw.c; the two backends must produce
+ * identical indices or keyboard shaders behave differently per build. */
 static int map_sdl_key(SDL_Scancode sc)
 {
     if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z)
-        return 'a' + (sc - SDL_SCANCODE_A);
+        return 'A' + (sc - SDL_SCANCODE_A);
     if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9)
         return '1' + (sc - SDL_SCANCODE_1);
     if (sc == SDL_SCANCODE_0) return '0';
     if (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12)
         return 112 + (sc - SDL_SCANCODE_F1);
+    if (sc >= SDL_SCANCODE_KP_0 && sc <= SDL_SCANCODE_KP_9)
+        return 96 + (sc - SDL_SCANCODE_KP_0);
     switch (sc) {
     case SDL_SCANCODE_SPACE:         return 32;
     case SDL_SCANCODE_APOSTROPHE:    return 222;
     case SDL_SCANCODE_COMMA:         return 188;
-    case SDL_SCANCODE_MINUS:         return 173;
+    case SDL_SCANCODE_MINUS:         return 189;
     case SDL_SCANCODE_PERIOD:        return 190;
     case SDL_SCANCODE_SLASH:         return 191;
-    case SDL_SCANCODE_SEMICOLON:     return 59;
-    case SDL_SCANCODE_EQUALS:        return 61;
+    case SDL_SCANCODE_SEMICOLON:     return 186;
+    case SDL_SCANCODE_EQUALS:        return 187;
     case SDL_SCANCODE_LEFTBRACKET:   return 219;
     case SDL_SCANCODE_BACKSLASH:     return 220;
     case SDL_SCANCODE_RIGHTBRACKET:  return 221;
@@ -751,6 +762,14 @@ int main(int argc, char **argv)
             case SDL_KEYDOWN: {
                 SDL_Keycode key = ev.key.keysym.sym;
                 SDL_Scancode sc = ev.key.keysym.scancode;
+
+                /* Auto-repeat is not a new press. GLFW reports repeats as
+                 * GLFW_REPEAT and key_callback ignores them, so SDL has to
+                 * ignore them too: otherwise holding a key flips the toggled
+                 * row every repeat, and a held arrow key re-fires
+                 * switch_shader() at the keyboard repeat rate. */
+                if (ev.key.repeat)
+                    break;
 
                 /* Shadertoy key state texture */
                 int js = map_sdl_key(sc);

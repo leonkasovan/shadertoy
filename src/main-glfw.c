@@ -337,7 +337,12 @@ static void mouse_cb(GLFWwindow *w, int button, int action, int mods)
 static unsigned char keyStateData[256 * 3];
 static GLuint keyStateTexID = 0;
 
-/* Map GLFW key codes → Shadertoy / JS key codes */
+/* Map GLFW key codes → Shadertoy / JS key codes.
+ *
+ * Letters are GLFW's own 65..90, which already match the uppercase ASCII
+ * codes JavaScript reports for both cases of a letter. Punctuation uses the
+ * JS keyCode table (minus 189, equal 187, semicolon 186, ...), not ASCII.
+ * Keep this table in step with map_sdl_key() in main-sdl2.c. */
 static int keyLookup[GLFW_KEY_LAST + 1];
 
 static void populate_key_lookup(void)
@@ -355,11 +360,11 @@ static void populate_key_lookup(void)
     keyLookup[GLFW_KEY_SPACE]         = 32;
     keyLookup[GLFW_KEY_APOSTROPHE]    = 222;
     keyLookup[GLFW_KEY_COMMA]         = 188;
-    keyLookup[GLFW_KEY_MINUS]         = 173;
+    keyLookup[GLFW_KEY_MINUS]         = 189;
     keyLookup[GLFW_KEY_PERIOD]        = 190;
     keyLookup[GLFW_KEY_SLASH]         = 191;
-    keyLookup[GLFW_KEY_SEMICOLON]     = 59;
-    keyLookup[GLFW_KEY_EQUAL]         = 61;
+    keyLookup[GLFW_KEY_SEMICOLON]     = 186;
+    keyLookup[GLFW_KEY_EQUAL]         = 187;
     keyLookup[GLFW_KEY_LEFT_BRACKET]  = 219;
     keyLookup[GLFW_KEY_BACKSLASH]     = 220;
     keyLookup[GLFW_KEY_RIGHT_BRACKET] = 221;
